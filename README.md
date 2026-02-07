@@ -1,3 +1,19 @@
+---
+license: mit
+task_categories:
+  - graph-ml
+tags:
+  - synthetic
+  - geometry
+  - graph-neural-network
+  - 3d
+  - centerline
+  - pipe-structures
+pretty_name: Shape Geometry Dataset
+size_categories:
+  - 100K<n<1M
+---
+
 # Shape Geometry Dataset
 
 Synthetic graph-based centerline representations of 3D geometric motifs (pipe-like structures).
