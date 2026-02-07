@@ -35,11 +35,11 @@ OUTPUT_DIR = Path("dataset_output")
 SAVE_FORMAT = "json"
 
 # ─── counts ───────────────────────────────────────────────────────────
-N_STRAIGHT  = 1000
-N_CORNER    = 1000
-N_JUNCT_T   = 1000
-N_JUNCT_Y   = 1000
-N_PER_ARC   = 1000
+N_STRAIGHT  = 10000
+N_CORNER    = 10000
+N_JUNCT_T   = 10000
+N_JUNCT_Y   = 10000
+N_PER_ARC   = 10000
 ARC_ANGLES  = list(range(10, 180, 10))
 
 
