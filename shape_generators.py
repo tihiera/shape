@@ -70,17 +70,25 @@ def generate_straight(length: float | None = None,
 # ──────────────────────────────────────────────
 
 def generate_arc(angle_deg: float = 90.0,
-                 radius: float = 10.0,
+                 arc_length: float | None = None,
                  rng: np.random.Generator | None = None
                  ) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
     """
-    Circular arc in the XY-plane of given *angle_deg* and *radius*,
-    discretised so adjacent nodes are ~1 unit apart.
+    Circular arc whose **total angular deviation** equals *angle_deg*.
+
+    The radius is derived:  R = arc_length / theta.
+
+    Small angles → large radius → gentle curve (almost straight).
+    Large angles → small radius → tight curve.
     """
     rng = rng or np.random.default_rng()
+    if arc_length is None:
+        arc_length = rng.uniform(10.0, 20.0)
+
     theta = np.deg2rad(angle_deg)
-    arc_len = radius * theta
-    n_pts = max(int(round(arc_len)) + 1, 2)
+    radius = arc_length / theta            # R derived from desired angle
+
+    n_pts = max(int(round(arc_length)) + 1, 2)   # ~1-unit node spacing
     angles = np.linspace(0, theta, n_pts)
 
     # optionally flip direction (clockwise / counter-clockwise)
