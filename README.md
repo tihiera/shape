@@ -66,4 +66,4 @@ Synthetic graph-based centerline representations of 3D geometric motifs (pipe-li
 python generate_geometry_dataset.py
 ```
 
-Generates 1000 samples per category (17 arc classes + straight + corner + junction_T + junction_Y = 21 categories, 21k samples total).
+Generates 10000 samples per category (17 arc classes + straight + corner + junction_T + junction_Y = 21 categories, 21k samples total).
