@@ -1,17 +1,9 @@
 ---
 license: mit
-task_categories:
-  - graph-ml
-tags:
-  - synthetic
-  - geometry
-  - graph-neural-network
-  - 3d
-  - centerline
-  - pipe-structures
 pretty_name: Shape Geometry Dataset
-size_categories:
-  - 100K<n<1M
+tags: [synthetic, geometry, graph-neural-network, 3d]
+task_categories: [graph-ml]
+size_categories: [100K<n<1M]
 ---
 
 # Shape Geometry Dataset
