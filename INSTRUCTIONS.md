@@ -3,6 +3,7 @@
 ## Prerequisites
 
 ```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 ```
 

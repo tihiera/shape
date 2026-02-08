@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-train_supcon.py
-───────────────
+train.py
+────────
 Train a GATv2-based graph encoder with supervised contrastive loss (SupCon).
 
 The encoder maps each variable-size graph to a 256-dim L2-normalised embedding.
@@ -16,13 +16,13 @@ Reads:   processed/train.pt, processed/val.pt, processed/test.pt
 Usage
 ─────
     # dry-run (50 steps, diagnostics only)
-    python train_supcon.py --dry-run
+    python train.py --dry-run
 
     # full training
-    python train_supcon.py --epochs 100 --batch-size 256 --lr 1e-3
+    python train.py --epochs 100 --batch-size 256 --lr 1e-3
 
     # custom delta for arc positives
-    python train_supcon.py --delta-deg 20 --epochs 50
+    python train.py --delta-deg 20 --epochs 50
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GATv2Conv, global_mean_pool
-from torch_geometric.nn import GlobalAttention
+from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn.aggr import AttentionalAggregation
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -79,16 +79,21 @@ def parse_args() -> argparse.Namespace:
 
 class ShapeEncoder(nn.Module):
     """
-    GATv2 graph encoder → L2-normalised embedding.
+    GATv2 graph encoder -> L2-normalised embedding.
 
     Architecture:
-        node MLP → [GATv2 + residual] × L → GlobalAttention pool → projection MLP → L2 norm
+        node MLP -> [GATv2 + residual] x L
+        -> AttentionalAggregation pool
+        -> concat global features (num_nodes, total_bend)
+        -> projection MLP -> L2 norm
     """
 
     def __init__(self, in_dim: int = 3, hidden_dim: int = 128,
                  embed_dim: int = 256, heads: int = 4,
-                 num_layers: int = 4, dropout: float = 0.1):
+                 num_layers: int = 4, dropout: float = 0.1,
+                 n_global_feats: int = 2):
         super().__init__()
+        self.n_global_feats = n_global_feats
 
         # node encoder
         self.node_enc = nn.Sequential(
@@ -118,18 +123,20 @@ class ShapeEncoder(nn.Module):
             else:
                 self.res_projs.append(nn.Identity())
 
-        # global attention pooling
+        # attentional aggregation pooling (replaces deprecated GlobalAttention)
         gate_nn = nn.Sequential(
-            nn.Linear(hidden_dim * heads, 1),
-        )
-        self.pool = GlobalAttention(gate_nn)
-
-        # projection head
-        pool_dim = hidden_dim * heads
-        self.proj = nn.Sequential(
-            nn.Linear(pool_dim, pool_dim),
+            nn.Linear(hidden_dim * heads, hidden_dim),
             nn.ReLU(),
-            nn.Linear(pool_dim, embed_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.pool = AttentionalAggregation(gate_nn)
+
+        # projection head: pool_dim + global features -> embed_dim
+        pool_dim = hidden_dim * heads + n_global_feats
+        self.proj = nn.Sequential(
+            nn.Linear(pool_dim, hidden_dim * heads),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * heads, embed_dim),
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -137,21 +144,37 @@ class ShapeEncoder(nn.Module):
     def forward(self, data) -> torch.Tensor:
         x, edge_index, batch = data.x, data.edge_index, data.batch
 
-        # node encode
-        x = self.node_enc(x)
+        # ── node encode ──
+        h = self.node_enc(x)
 
-        # GAT layers with residual
+        # ── GAT layers with residual ──
         for gat, norm, res_proj in zip(self.gat_layers, self.gat_norms, self.res_projs):
-            residual = res_proj(x)
-            x = gat(x, edge_index)
-            x = norm(x)
-            x = F.elu(x + residual)
-            x = self.dropout(x)
+            residual = res_proj(h)
+            h = gat(h, edge_index)
+            h = norm(h)
+            h = F.elu(h + residual)
+            h = self.dropout(h)
 
-        # pool
-        g = self.pool(x, batch)  # (B, hidden*heads)
+        # ── pool ──
+        g = self.pool(h, index=batch)  # (B, hidden*heads)
 
-        # project + L2 normalise
+        # ── global features: num_nodes + total_bend per graph ──
+        # bend_rad is x[:, 1] (second feature column)
+        bend_rad = x[:, 1]
+        B = g.size(0)
+        num_nodes = torch.zeros(B, device=g.device)
+        total_bend = torch.zeros(B, device=g.device)
+        num_nodes.scatter_add_(0, batch, torch.ones_like(batch, dtype=torch.float))
+        total_bend.scatter_add_(0, batch, bend_rad)
+
+        # normalise global features for stable training
+        num_nodes_norm = num_nodes / 20.0        # ~10-20 nodes, so /20 puts in [0.5, 1]
+        total_bend_norm = total_bend / math.pi   # total bend in radians, /pi normalises
+
+        global_feats = torch.stack([num_nodes_norm, total_bend_norm], dim=1)  # (B, 2)
+        g = torch.cat([g, global_feats], dim=1)  # (B, hidden*heads + 2)
+
+        # ── project + L2 normalise ──
         z = self.proj(g)
         z = F.normalize(z, p=2, dim=-1)
         return z
@@ -163,18 +186,19 @@ class ShapeEncoder(nn.Module):
 
 def build_positive_mask(motif_ids: torch.Tensor,
                         arc_angles: torch.Tensor,
-                        delta_deg: float) -> torch.Tensor:
+                        delta_deg: float,
+                        arc_motif_id: int) -> torch.Tensor:
     """
     Build a (B, B) boolean positive-pair mask.
 
     Rules:
-      - Both arcs (motif_id==0): positive if |angle_i - angle_j| <= delta_deg
+      - Both arcs (motif_id==arc_motif_id): positive if |angle_i - angle_j| <= delta_deg
       - Both non-arcs: positive if motif_type matches exactly
       - Mixed arc/non-arc: negative
       - Self-pairs (diagonal): False
     """
     B = len(motif_ids)
-    is_arc = (motif_ids == 0)  # arc motif_type_id == 0
+    is_arc = (motif_ids == arc_motif_id)
 
     # expand for pairwise comparison
     is_arc_i = is_arc.unsqueeze(1).expand(B, B)
@@ -310,24 +334,56 @@ class BalancedBatchSampler:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# EVALUATION: RETRIEVAL@K
+# STRATIFIED VAL SUBSET
+# ═══════════════════════════════════════════════════════════════════════
+
+def stratified_val_subset(data_list: List[Data],
+                          max_total: int = 2000,
+                          seed: int = 42) -> List[Data]:
+    """
+    Pick a stratified random subset from val, ensuring every
+    (motif_type_id, arc_angle_deg) group is represented equally.
+    """
+    rng = np.random.default_rng(seed)
+    groups: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for idx, d in enumerate(data_list):
+        groups[(d.motif_type_id, d.arc_angle_deg)].append(idx)
+
+    n_groups = len(groups)
+    per_group = max(1, max_total // n_groups)
+
+    indices = []
+    for key in sorted(groups):
+        pool = np.array(groups[key])
+        rng.shuffle(pool)
+        indices.extend(pool[:per_group].tolist())
+
+    rng.shuffle(indices)
+    return [data_list[i] for i in indices[:max_total]]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EVALUATION: RETRIEVAL@K + ARC ANGLE ERROR
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def evaluate_retrieval(model: ShapeEncoder,
                        data_list: List[Data],
                        delta_deg: float,
+                       arc_motif_id: int,
                        k: int = 5,
                        batch_size: int = 512,
                        device: str = "cpu") -> Dict[str, float]:
     """
-    Retrieval@K evaluation.
+    Retrieval@K evaluation + mean arc angle error.
 
     For each query graph, find its K nearest neighbours in embedding space.
     A retrieved neighbour is correct if:
       - Both arcs: |angle_query - angle_retrieved| <= delta_deg
       - Both non-arcs: motif_type matches
       - Mixed: incorrect
+
+    Also computes mean |delta_angle| for arc-to-arc retrievals.
     """
     model.eval()
     loader = DataLoader(data_list, batch_size=batch_size, shuffle=False)
@@ -358,49 +414,92 @@ def evaluate_retrieval(model: ShapeEncoder,
     _, topk_idx = sim.topk(k, dim=1)  # (N, K)
 
     # check correctness
-    is_arc = (motif_ids == 0)
+    is_arc = (motif_ids == arc_motif_id)
     hits = 0
     total = 0
 
-    for i in range(N):
-        for j_pos in range(k):
-            j = topk_idx[i, j_pos].item()
-            total += 1
-
-            if is_arc[i] and is_arc[j]:
-                if abs(angles[i].item() - angles[j].item()) <= delta_deg:
-                    hits += 1
-            elif (not is_arc[i]) and (not is_arc[j]):
-                if motif_ids[i] == motif_ids[j]:
-                    hits += 1
-            # else: mixed → miss
-
-    precision_at_k = hits / total if total > 0 else 0.0
+    # arc angle error tracking
+    arc_angle_errors = []
 
     # per-motif breakdown
     motif_hits: Dict[int, int] = defaultdict(int)
     motif_total: Dict[int, int] = defaultdict(int)
+
     for i in range(N):
         mid = motif_ids[i].item()
         for j_pos in range(k):
             j = topk_idx[i, j_pos].item()
+            total += 1
             motif_total[mid] += 1
+
             if is_arc[i] and is_arc[j]:
-                if abs(angles[i].item() - angles[j].item()) <= delta_deg:
+                delta = abs(angles[i].item() - angles[j].item())
+                arc_angle_errors.append(delta)
+                if delta <= delta_deg:
+                    hits += 1
                     motif_hits[mid] += 1
             elif (not is_arc[i]) and (not is_arc[j]):
                 if motif_ids[i] == motif_ids[j]:
+                    hits += 1
                     motif_hits[mid] += 1
+            # else: mixed -> miss
+
+    precision_at_k = hits / total if total > 0 else 0.0
+    mean_arc_angle_err = float(np.mean(arc_angle_errors)) if arc_angle_errors else 0.0
 
     return {
         "precision@k": precision_at_k,
         "k": k,
+        "mean_arc_angle_err": mean_arc_angle_err,
         "motif_precision": {
             mid: motif_hits[mid] / motif_total[mid]
             for mid in sorted(motif_total)
             if motif_total[mid] > 0
         },
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BATCH SANITY DIAGNOSTICS
+# ═══════════════════════════════════════════════════════════════════════
+
+def print_batch_diagnostics(motif_ids: torch.Tensor,
+                            arc_angles: torch.Tensor,
+                            pos_mask: torch.Tensor,
+                            arc_motif_id: int,
+                            id2motif: Dict[int, str]) -> None:
+    """Print once-per-run sanity stats about the batch composition."""
+    is_arc = (motif_ids == arc_motif_id)
+    n_arc = is_arc.sum().item()
+    n_nonarc = len(motif_ids) - n_arc
+
+    print("\n── batch sanity check ──")
+    print(f"  batch size     : {len(motif_ids)}")
+    print(f"  arcs           : {n_arc}")
+    print(f"  non-arcs       : {n_nonarc}")
+
+    # unique motif types + counts
+    unique_motifs, counts = motif_ids.unique(return_counts=True)
+    for m, c in zip(unique_motifs.tolist(), counts.tolist()):
+        name = id2motif.get(m, f"id={m}")
+        print(f"    {name:>14s}: {c}")
+
+    # arc angles present
+    if n_arc > 0:
+        arc_angle_vals = arc_angles[is_arc].unique().sort().values
+        print(f"  arc angles     : {arc_angle_vals.tolist()}")
+        # check for -1 bug
+        if (arc_angle_vals == -1).any():
+            print("  *** WARNING: arc samples have arc_angle_deg=-1! Preprocessing bug! ***")
+
+    # positive mask stats
+    pos_per_anchor = pos_mask.float().sum(dim=1)
+    arc_pos = pos_per_anchor[is_arc].mean().item() if n_arc > 0 else 0
+    nonarc_pos = pos_per_anchor[~is_arc].mean().item() if n_nonarc > 0 else 0
+    print(f"  avg pos (arc)  : {arc_pos:.1f}")
+    print(f"  avg pos (other): {nonarc_pos:.1f}")
+    print(f"  avg pos (all)  : {pos_per_anchor.mean().item():.1f}")
+    print()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -417,7 +516,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"[cfg] device={device}  epochs={args.epochs}  batch_size={args.batch_size}")
     print(f"[cfg] delta_deg={args.delta_deg}  temperature={args.temperature}")
     if args.dry_run:
-        print("[cfg] DRY RUN — 50 steps only")
+        print("[cfg] DRY RUN -- 50 steps only")
 
     # load data
     proc = Path(args.processed_dir)
@@ -428,6 +527,10 @@ def train(args: argparse.Namespace) -> None:
     with open(proc / "meta.json") as f:
         meta = json.load(f)
     id2motif = {v: k for k, v in meta["motif_type_to_id"].items()}
+
+    # read arc motif id from meta (not hardcoded)
+    arc_motif_id = meta["motif_type_to_id"]["arc"]
+    print(f"[meta] arc motif_type_id = {arc_motif_id}")
 
     # model
     in_dim = train_data[0].x.size(1)
@@ -454,9 +557,14 @@ def train(args: argparse.Namespace) -> None:
     sampler = BalancedBatchSampler(train_data, batch_size=args.batch_size, seed=args.seed)
     train_loader = DataLoader(train_data, batch_sampler=sampler)
 
+    # prepare stratified val subset (once)
+    val_subset = stratified_val_subset(val_data, max_total=2000, seed=args.seed)
+    print(f"[eval] stratified val subset: {len(val_subset)} samples")
+
     # training
     max_steps = 50 if args.dry_run else None
     global_step = 0
+    did_diagnostics = False
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -478,7 +586,14 @@ def train(args: argparse.Namespace) -> None:
             arc_angles = batch.arc_angle_deg.to(device)
 
             # build positive mask
-            pos_mask = build_positive_mask(motif_ids, arc_angles, args.delta_deg)
+            pos_mask = build_positive_mask(motif_ids, arc_angles,
+                                           args.delta_deg, arc_motif_id)
+
+            # one-time batch sanity diagnostics
+            if not did_diagnostics:
+                print_batch_diagnostics(motif_ids, arc_angles, pos_mask,
+                                        arc_motif_id, id2motif)
+                did_diagnostics = True
 
             # loss
             loss = supcon_loss(z, pos_mask, temperature=args.temperature)
@@ -513,25 +628,27 @@ def train(args: argparse.Namespace) -> None:
         # evaluate every 5 epochs (or last epoch)
         eval_str = ""
         if epoch % 5 == 0 or epoch == args.epochs:
-            # subsample val for speed
-            val_subset = val_data[:2000] if len(val_data) > 2000 else val_data
             metrics = evaluate_retrieval(
                 model, val_subset, args.delta_deg,
+                arc_motif_id=arc_motif_id,
                 k=args.eval_k, device=device
             )
-            eval_str = f"  ret@{args.eval_k}={metrics['precision@k']:.3f}"
+            eval_str = (f"  ret@{args.eval_k}={metrics['precision@k']:.3f}"
+                        f"  arc_err={metrics['mean_arc_angle_err']:.1f}deg")
 
         print(f"epoch {epoch:>3d}/{args.epochs}  loss={avg_loss:.4f}  "
               f"avg_pos={avg_pos_per_anchor:.1f}  lr={scheduler.get_last_lr()[0]:.2e}  "
               f"time={elapsed:.1f}s{eval_str}")
 
     # final eval on full val
-    print("\n── Final evaluation on val set ──")
+    print("\n── Final evaluation on full val set ──")
     metrics = evaluate_retrieval(
         model, val_data, args.delta_deg,
+        arc_motif_id=arc_motif_id,
         k=args.eval_k, device=device
     )
-    print(f"  retrieval@{args.eval_k} = {metrics['precision@k']:.4f}")
+    print(f"  retrieval@{args.eval_k}       = {metrics['precision@k']:.4f}")
+    print(f"  mean arc angle err = {metrics['mean_arc_angle_err']:.1f} deg")
     print("  per-motif precision:")
     for mid in sorted(metrics["motif_precision"]):
         name = id2motif.get(mid, f"id={mid}")
@@ -544,7 +661,7 @@ def train(args: argparse.Namespace) -> None:
         "args": vars(args),
         "meta": meta,
     }, ckpt_path)
-    print(f"\n[io] saved checkpoint → {ckpt_path}")
+    print(f"\n[io] saved checkpoint -> {ckpt_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
