@@ -277,11 +277,15 @@ def supcon_loss(embeddings: torch.Tensor,
 
 class BalancedBatchSampler:
     """
-    Sample batches ensuring multiple samples per motif_type and per arc angle,
-    so every anchor has at least some positives.
+    Motif-balanced batch sampler.
 
-    Strategy: pick samples_per_group from each group, where groups are
-    defined by (motif_type, arc_angle_bucket).
+    Groups are (motif_type_id, arc_angle_deg).  Sampling probability is
+    weighted so that every **motif type** gets equal representation,
+    regardless of how many angle-subgroups it has.
+
+    e.g. "arc" has 17 groups but "junction_Y" has 1 group.
+    Without balancing, arc dominates; with balancing, each motif
+    type is equally likely to be picked per slot.
     """
 
     def __init__(self, data_list: List[Data], batch_size: int,
@@ -299,15 +303,26 @@ class BalancedBatchSampler:
         self.group_keys = list(self.groups.keys())
         self.n = len(data_list)
 
+        # motif-balanced sampling weights:
+        # each group's probability = 1 / (n_motifs * n_groups_for_that_motif)
+        motif_to_keys: Dict[int, List] = defaultdict(list)
+        for k in self.group_keys:
+            motif_to_keys[k[0]].append(k)
+
+        weights = np.array([
+            1.0 / len(motif_to_keys[k[0]]) for k in self.group_keys
+        ], dtype=np.float64)
+        self.group_probs = weights / weights.sum()
+
     def __iter__(self):
-        # how many groups fit in one batch
         n_groups = max(1, self.batch_size // self.samples_per_group)
         n_batches = self.n // self.batch_size
 
         for _ in range(n_batches):
-            # pick random groups
+            # pick groups with motif-balanced probabilities
             chosen_keys = self.rng.choice(
-                len(self.group_keys), size=n_groups, replace=True
+                len(self.group_keys), size=n_groups, replace=True,
+                p=self.group_probs,
             )
             batch_indices = []
             for ki in chosen_keys:
@@ -418,8 +433,11 @@ def evaluate_retrieval(model: ShapeEncoder,
     hits = 0
     total = 0
 
-    # arc angle error tracking
+    # arc angle error tracking (all arc-arc pairs in top-K)
     arc_angle_errors = []
+
+    # per-query mean |delta_angle| for arc queries (stronger metric)
+    arc_query_mean_deltas = []
 
     # per-motif breakdown
     motif_hits: Dict[int, int] = defaultdict(int)
@@ -427,6 +445,8 @@ def evaluate_retrieval(model: ShapeEncoder,
 
     for i in range(N):
         mid = motif_ids[i].item()
+        query_arc_deltas = []
+
         for j_pos in range(k):
             j = topk_idx[i, j_pos].item()
             total += 1
@@ -435,6 +455,7 @@ def evaluate_retrieval(model: ShapeEncoder,
             if is_arc[i] and is_arc[j]:
                 delta = abs(angles[i].item() - angles[j].item())
                 arc_angle_errors.append(delta)
+                query_arc_deltas.append(delta)
                 if delta <= delta_deg:
                     hits += 1
                     motif_hits[mid] += 1
@@ -444,13 +465,19 @@ def evaluate_retrieval(model: ShapeEncoder,
                     motif_hits[mid] += 1
             # else: mixed -> miss
 
+        # per-query arc delta (only for arc queries with arc neighbours)
+        if is_arc[i] and len(query_arc_deltas) > 0:
+            arc_query_mean_deltas.append(float(np.mean(query_arc_deltas)))
+
     precision_at_k = hits / total if total > 0 else 0.0
     mean_arc_angle_err = float(np.mean(arc_angle_errors)) if arc_angle_errors else 0.0
+    mean_arc_topk_delta = float(np.mean(arc_query_mean_deltas)) if arc_query_mean_deltas else 0.0
 
     return {
         "precision@k": precision_at_k,
         "k": k,
         "mean_arc_angle_err": mean_arc_angle_err,
+        "mean_arc_topk_delta": mean_arc_topk_delta,
         "motif_precision": {
             mid: motif_hits[mid] / motif_total[mid]
             for mid in sorted(motif_total)
@@ -634,7 +661,8 @@ def train(args: argparse.Namespace) -> None:
                 k=args.eval_k, device=device
             )
             eval_str = (f"  ret@{args.eval_k}={metrics['precision@k']:.3f}"
-                        f"  arc_err={metrics['mean_arc_angle_err']:.1f}deg")
+                        f"  arc_err={metrics['mean_arc_angle_err']:.1f}deg"
+                        f"  arc_topk={metrics['mean_arc_topk_delta']:.1f}deg")
 
         print(f"epoch {epoch:>3d}/{args.epochs}  loss={avg_loss:.4f}  "
               f"avg_pos={avg_pos_per_anchor:.1f}  lr={scheduler.get_last_lr()[0]:.2e}  "
@@ -649,6 +677,7 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"  retrieval@{args.eval_k}       = {metrics['precision@k']:.4f}")
     print(f"  mean arc angle err = {metrics['mean_arc_angle_err']:.1f} deg")
+    print(f"  mean arc topK delta= {metrics['mean_arc_topk_delta']:.1f} deg  (should decrease over epochs)")
     print("  per-motif precision:")
     for mid in sorted(metrics["motif_precision"]):
         name = id2motif.get(mid, f"id={mid}")
