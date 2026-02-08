@@ -10,19 +10,21 @@ Positive pairs are defined by a custom mask:
   - Both non-arcs:  positive if motif_type matches exactly
   - Otherwise:      negative
 
+Features:
+  - TensorBoard logging (loss, retrieval, arc metrics, per-motif precision)
+  - Early stopping with patience (based on eval checks every 5 epochs)
+
 Reads:   processed/train.pt, processed/val.pt, processed/test.pt
          processed/meta.json
 
 Usage
 ─────
-    # dry-run (50 steps, diagnostics only)
     python train.py --dry-run
-
-    # full training
     python train.py --epochs 100 --batch-size 256 --lr 1e-3
+    python train.py --delta-deg 20 --epochs 50 --patience 10
 
-    # custom delta for arc positives
-    python train.py --delta-deg 20 --epochs 50
+    # view tensorboard
+    tensorboard --logdir runs/
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv
@@ -65,6 +68,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.07)
     p.add_argument("--eval-k", type=int, default=5,
                    help="K for retrieval@K evaluation")
+    p.add_argument("--patience", type=int, default=5,
+                   help="Early stopping patience (in eval checks, every 5 epochs)")
+    p.add_argument("--log-dir", type=str, default="runs",
+                   help="TensorBoard log directory")
     p.add_argument("--dry-run", action="store_true",
                    help="Run 50 steps only, print diagnostics")
     p.add_argument("--seed", type=int, default=42)
@@ -220,17 +227,11 @@ def build_positive_mask(motif_ids: torch.Tensor,
 def supcon_loss(embeddings: torch.Tensor,
                 pos_mask: torch.Tensor,
                 temperature: float = 0.07) -> torch.Tensor:
-    """
-    Supervised contrastive loss (SupCon).
-
-    For each anchor i, the loss pushes positives closer and negatives apart
-    in the embedding space using the InfoNCE formulation.
-    """
+    """Supervised contrastive loss (SupCon)."""
     B = embeddings.size(0)
     device = embeddings.device
 
-    # cosine similarity (embeddings are already L2-normalised)
-    sim = embeddings @ embeddings.T  # (B, B)
+    sim = embeddings @ embeddings.T
     sim = sim / temperature
 
     # mask out self-similarity
@@ -243,18 +244,13 @@ def supcon_loss(embeddings: torch.Tensor,
 
     # exp similarities
     exp_sim = sim.exp()
+    denom = exp_sim.masked_fill(self_mask, 0.0).sum(dim=1, keepdim=True)
 
-    # denominator: sum over all non-self
-    denom = exp_sim.masked_fill(self_mask, 0.0).sum(dim=1, keepdim=True)  # (B, 1)
+    log_prob = sim - denom.log()
 
-    # log prob for positives
-    log_prob = sim - denom.log()  # (B, B)
-
-    # average over positives for each anchor
     pos_mask_float = pos_mask.float()
-    n_pos = pos_mask_float.sum(dim=1)  # (B,)
+    n_pos = pos_mask_float.sum(dim=1)
 
-    # skip anchors with zero positives
     valid = n_pos > 0
     if valid.sum() == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
@@ -275,10 +271,6 @@ class BalancedBatchSampler:
     Groups are (motif_type_id, arc_angle_deg).  Sampling probability is
     weighted so that every **motif type** gets equal representation,
     regardless of how many angle-subgroups it has.
-
-    e.g. "arc" has 17 groups but "junction_Y" has 1 group.
-    Without balancing, arc dominates; with balancing, each motif
-    type is equally likely to be picked per slot.
     """
 
     def __init__(self, data_list: List[Data], batch_size: int,
@@ -287,7 +279,6 @@ class BalancedBatchSampler:
         self.batch_size = batch_size
         self.samples_per_group = samples_per_group
 
-        # group indices by (motif_type_id, arc_angle_deg)
         self.groups: Dict[Tuple[int, int], List[int]] = defaultdict(list)
         for idx, d in enumerate(data_list):
             key = (d.motif_type_id, d.arc_angle_deg)
@@ -296,8 +287,6 @@ class BalancedBatchSampler:
         self.group_keys = list(self.groups.keys())
         self.n = len(data_list)
 
-        # motif-balanced sampling weights:
-        # each group's probability = 1 / (n_motifs * n_groups_for_that_motif)
         motif_to_keys: Dict[int, List] = defaultdict(list)
         for k in self.group_keys:
             motif_to_keys[k[0]].append(k)
@@ -312,7 +301,6 @@ class BalancedBatchSampler:
         n_batches = self.n // self.batch_size
 
         for _ in range(n_batches):
-            # pick groups with motif-balanced probabilities
             chosen_keys = self.rng.choice(
                 len(self.group_keys), size=n_groups, replace=True,
                 p=self.group_probs,
@@ -328,7 +316,6 @@ class BalancedBatchSampler:
                 )
                 batch_indices.extend(chosen.tolist())
 
-            # trim or pad to exact batch_size
             if len(batch_indices) > self.batch_size:
                 batch_indices = batch_indices[:self.batch_size]
             elif len(batch_indices) < self.batch_size:
@@ -384,14 +371,6 @@ def evaluate_retrieval(model: ShapeEncoder,
                        device: str = "cpu") -> Dict[str, float]:
     """
     Retrieval@K evaluation + mean arc angle error.
-
-    For each query graph, find its K nearest neighbours in embedding space.
-    A retrieved neighbour is correct if:
-      - Both arcs: |angle_query - angle_retrieved| <= delta_deg
-      - Both non-arcs: motif_type matches
-      - Mixed: incorrect
-
-    Also computes mean |delta_angle| for arc-to-arc retrievals.
     """
     model.eval()
     loader = DataLoader(data_list, batch_size=batch_size, shuffle=False)
@@ -409,30 +388,23 @@ def evaluate_retrieval(model: ShapeEncoder,
         all_angles.append(batch.arc_angle_deg.cpu() if hasattr(batch, 'arc_angle_deg')
                           else torch.tensor([d.arc_angle_deg for d in batch.to_data_list()]))
 
-    embeds = torch.cat(all_embeds, dim=0)          # (N, D)
-    motif_ids = torch.cat(all_motif_ids, dim=0)    # (N,)
-    angles = torch.cat(all_angles, dim=0)           # (N,)
+    embeds = torch.cat(all_embeds, dim=0)
+    motif_ids = torch.cat(all_motif_ids, dim=0)
+    angles = torch.cat(all_angles, dim=0)
     N = len(embeds)
 
-    # pairwise cosine similarity
     sim = embeds @ embeds.T
-    sim.fill_diagonal_(-1e9)  # exclude self
+    sim.fill_diagonal_(-1e9)
 
-    # top-K
-    _, topk_idx = sim.topk(k, dim=1)  # (N, K)
+    _, topk_idx = sim.topk(k, dim=1)
 
-    # check correctness
     is_arc = (motif_ids == arc_motif_id)
     hits = 0
     total = 0
 
-    # arc angle error tracking (all arc-arc pairs in top-K)
     arc_angle_errors = []
-
-    # per-query mean |delta_angle| for arc queries (stronger metric)
     arc_query_mean_deltas = []
 
-    # per-motif breakdown
     motif_hits: Dict[int, int] = defaultdict(int)
     motif_total: Dict[int, int] = defaultdict(int)
 
@@ -456,9 +428,7 @@ def evaluate_retrieval(model: ShapeEncoder,
                 if motif_ids[i] == motif_ids[j]:
                     hits += 1
                     motif_hits[mid] += 1
-            # else: mixed -> miss
 
-        # per-query arc delta (only for arc queries with arc neighbours)
         if is_arc[i] and len(query_arc_deltas) > 0:
             arc_query_mean_deltas.append(float(np.mean(query_arc_deltas)))
 
@@ -498,21 +468,17 @@ def print_batch_diagnostics(motif_ids: torch.Tensor,
     print(f"  arcs           : {n_arc}")
     print(f"  non-arcs       : {n_nonarc}")
 
-    # unique motif types + counts
     unique_motifs, counts = motif_ids.unique(return_counts=True)
     for m, c in zip(unique_motifs.tolist(), counts.tolist()):
         name = id2motif.get(m, f"id={m}")
         print(f"    {name:>14s}: {c}")
 
-    # arc angles present
     if n_arc > 0:
         arc_angle_vals = arc_angles[is_arc].unique().sort().values
         print(f"  arc angles     : {arc_angle_vals.tolist()}")
-        # check for -1 bug
         if (arc_angle_vals == -1).any():
             print("  *** WARNING: arc samples have arc_angle_deg=-1! Preprocessing bug! ***")
 
-    # positive mask stats
     pos_per_anchor = pos_mask.float().sum(dim=1)
     arc_pos = pos_per_anchor[is_arc].mean().item() if n_arc > 0 else 0
     nonarc_pos = pos_per_anchor[~is_arc].mean().item() if n_nonarc > 0 else 0
@@ -520,6 +486,41 @@ def print_batch_diagnostics(motif_ids: torch.Tensor,
     print(f"  avg pos (other): {nonarc_pos:.1f}")
     print(f"  avg pos (all)  : {pos_per_anchor.mean().item():.1f}")
     print()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EARLY STOPPING
+# ═══════════════════════════════════════════════════════════════════════
+
+class EarlyStopping:
+    """
+    Early stopping based on a monitored metric (higher = better).
+    Triggers after *patience* eval checks with no improvement.
+    """
+
+    def __init__(self, patience: int = 5):
+        self.patience = patience
+        self.best_score = -float("inf")
+        self.best_epoch = 0
+        self.counter = 0
+        self.best_state = None
+
+    def step(self, score: float, epoch: int, model: nn.Module) -> bool:
+        """Returns True if training should stop."""
+        if score > self.best_score:
+            self.best_score = score
+            self.best_epoch = epoch
+            self.counter = 0
+            self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            return False
+        else:
+            self.counter += 1
+            return self.counter >= self.patience
+
+    def restore_best(self, model: nn.Module) -> None:
+        """Load the best checkpoint back into the model."""
+        if self.best_state is not None:
+            model.load_state_dict(self.best_state)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -534,9 +535,14 @@ def train(args: argparse.Namespace) -> None:
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"[cfg] device={device}  epochs={args.epochs}  batch_size={args.batch_size}")
-    print(f"[cfg] delta_deg={args.delta_deg}  temperature={args.temperature}")
+    print(f"[cfg] delta_deg={args.delta_deg}  temperature={args.temperature}  patience={args.patience}")
     if args.dry_run:
         print("[cfg] DRY RUN -- 50 steps only")
+
+    # tensorboard
+    run_name = f"supcon_d{args.delta_deg}_bs{args.batch_size}_lr{args.lr}_{int(time.time())}"
+    writer = SummaryWriter(log_dir=f"{args.log_dir}/{run_name}")
+    print(f"[tb] logging to {args.log_dir}/{run_name}")
 
     # load data
     proc = Path(args.processed_dir)
@@ -548,7 +554,6 @@ def train(args: argparse.Namespace) -> None:
         meta = json.load(f)
     id2motif = {v: k for k, v in meta["motif_type_to_id"].items()}
 
-    # read arc motif id from meta (not hardcoded)
     arc_motif_id = meta["motif_type_to_id"]["arc"]
     print(f"[meta] arc motif_type_id = {arc_motif_id}")
 
@@ -566,6 +571,9 @@ def train(args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] {n_params:,} trainable parameters")
 
+    # log hyperparams
+    writer.add_text("config", json.dumps(vars(args), indent=2))
+
     # optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                    weight_decay=args.weight_decay)
@@ -577,9 +585,12 @@ def train(args: argparse.Namespace) -> None:
     sampler = BalancedBatchSampler(train_data, batch_size=args.batch_size, seed=args.seed)
     train_loader = DataLoader(train_data, batch_sampler=sampler)
 
-    # prepare stratified val subset (once)
+    # stratified val subset
     val_subset = stratified_val_subset(val_data, max_total=2000, seed=args.seed)
     print(f"[eval] stratified val subset: {len(val_subset)} samples")
+
+    # early stopping
+    early_stop = EarlyStopping(patience=args.patience)
 
     # training
     max_steps = 50 if args.dry_run else None
@@ -599,23 +610,19 @@ def train(args: argparse.Namespace) -> None:
                 break
 
             batch = batch.to(device)
-            z = model(batch)  # (B, embed_dim)
+            z = model(batch)
 
-            # extract per-graph attributes
             motif_ids = batch.motif_type_id.to(device)
             arc_angles = batch.arc_angle_deg.to(device)
 
-            # build positive mask
             pos_mask = build_positive_mask(motif_ids, arc_angles,
                                            args.delta_deg, arc_motif_id)
 
-            # one-time batch sanity diagnostics
             if not did_diagnostics:
                 print_batch_diagnostics(motif_ids, arc_angles, pos_mask,
                                         arc_motif_id, id2motif)
                 did_diagnostics = True
 
-            # loss
             loss = supcon_loss(z, pos_mask, temperature=args.temperature)
 
             optimizer.zero_grad()
@@ -627,9 +634,12 @@ def train(args: argparse.Namespace) -> None:
             epoch_steps += 1
             global_step += 1
 
-            # track avg positives per anchor
             avg_pos = pos_mask.float().sum(dim=1).mean().item()
             epoch_avg_pos += avg_pos
+
+            # tensorboard: per-step
+            writer.add_scalar("train/loss_step", loss.item(), global_step)
+            writer.add_scalar("train/avg_pos_step", avg_pos, global_step)
 
             if args.dry_run and global_step % 10 == 0:
                 print(f"  step {global_step:>3d}  loss={loss.item():.4f}  "
@@ -645,21 +655,48 @@ def train(args: argparse.Namespace) -> None:
         avg_pos_per_anchor = epoch_avg_pos / max(epoch_steps, 1)
         elapsed = time.time() - t0
 
+        # tensorboard: per-epoch
+        writer.add_scalar("train/loss_epoch", avg_loss, epoch)
+        writer.add_scalar("train/avg_pos_epoch", avg_pos_per_anchor, epoch)
+        writer.add_scalar("train/lr", scheduler.get_last_lr()[0], epoch)
+
         # evaluate every 5 epochs (or last epoch)
         eval_str = ""
+        should_stop = False
         if epoch % 5 == 0 or epoch == args.epochs:
             metrics = evaluate_retrieval(
                 model, val_subset, args.delta_deg,
                 arc_motif_id=arc_motif_id,
                 k=args.eval_k, device=device
             )
+
+            # tensorboard: eval metrics
+            writer.add_scalar("val/precision_at_k", metrics["precision@k"], epoch)
+            writer.add_scalar("val/mean_arc_angle_err", metrics["mean_arc_angle_err"], epoch)
+            writer.add_scalar("val/mean_arc_topk_delta", metrics["mean_arc_topk_delta"], epoch)
+            for mid, prec in metrics["motif_precision"].items():
+                name = id2motif.get(mid, f"id={mid}")
+                writer.add_scalar(f"val/motif_{name}", prec, epoch)
+
             eval_str = (f"  ret@{args.eval_k}={metrics['precision@k']:.3f}"
                         f"  arc_err={metrics['mean_arc_angle_err']:.1f}deg"
                         f"  arc_topk={metrics['mean_arc_topk_delta']:.1f}deg")
 
+            # early stopping check
+            should_stop = early_stop.step(metrics["precision@k"], epoch, model)
+            if should_stop:
+                eval_str += f"  [EARLY STOP patience={args.patience}]"
+
         print(f"epoch {epoch:>3d}/{args.epochs}  loss={avg_loss:.4f}  "
               f"avg_pos={avg_pos_per_anchor:.1f}  lr={scheduler.get_last_lr()[0]:.2e}  "
               f"time={elapsed:.1f}s{eval_str}")
+
+        if should_stop:
+            print(f"\n[early-stop] no improvement for {args.patience} eval checks. "
+                  f"Best ret@{args.eval_k}={early_stop.best_score:.4f} at epoch {early_stop.best_epoch}")
+            early_stop.restore_best(model)
+            model = model.to(device)
+            break
 
     # final eval on full val
     print("\n── Final evaluation on full val set ──")
@@ -670,11 +707,18 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"  retrieval@{args.eval_k}       = {metrics['precision@k']:.4f}")
     print(f"  mean arc angle err = {metrics['mean_arc_angle_err']:.1f} deg")
-    print(f"  mean arc topK delta= {metrics['mean_arc_topk_delta']:.1f} deg  (should decrease over epochs)")
+    print(f"  mean arc topK delta= {metrics['mean_arc_topk_delta']:.1f} deg")
     print("  per-motif precision:")
     for mid in sorted(metrics["motif_precision"]):
         name = id2motif.get(mid, f"id={mid}")
         print(f"    {name:>14s}: {metrics['motif_precision'][mid]:.4f}")
+
+    # tensorboard: final
+    writer.add_hparams(
+        {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))},
+        {"hparam/precision_at_k": metrics["precision@k"],
+         "hparam/arc_topk_delta": metrics["mean_arc_topk_delta"]},
+    )
 
     # save model
     ckpt_path = proc / "encoder.pt"
@@ -682,8 +726,13 @@ def train(args: argparse.Namespace) -> None:
         "model_state_dict": model.state_dict(),
         "args": vars(args),
         "meta": meta,
+        "best_epoch": early_stop.best_epoch,
+        "best_score": early_stop.best_score,
     }, ckpt_path)
     print(f"\n[io] saved checkpoint -> {ckpt_path}")
+
+    writer.close()
+    print(f"[tb] closed. View with: tensorboard --logdir {args.log_dir}/")
 
 
 # ═══════════════════════════════════════════════════════════════════════

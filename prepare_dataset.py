@@ -48,6 +48,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# ─── numpy -> json serialisation ─────────────────────────────────────
+
+def _to_serialisable(obj):
+    """Recursively convert numpy types for json.dumps."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _to_serialisable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_serialisable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_to_serialisable(v) for v in obj]
+    return obj
+
+
 # ─── load raw data ───────────────────────────────────────────────────
 
 def load_raw(path: str) -> List[Dict[str, Any]]:
@@ -238,6 +257,21 @@ def main() -> None:
 
     # load
     raw = load_raw(args.input)
+
+    # rewrite raw dataset.json with junction_T/Y -> junction
+    _rewrite_count = 0
+    for sample in raw:
+        if sample["category"] in ("junction_T", "junction_Y"):
+            sample["category"] = "junction"
+            _rewrite_count += 1
+    if _rewrite_count > 0:
+        inp = Path(args.input)
+        clean_path = inp.parent / inp.name
+        print(f"[rewrite] {_rewrite_count} samples renamed junction_T/Y -> junction")
+        with open(clean_path, "w") as f:
+            json.dump(_to_serialisable(raw), f, indent=2)
+        size_mb = clean_path.stat().st_size / (1024 * 1024)
+        print(f"[rewrite] saved clean {clean_path}  ({size_mb:.2f} MB)")
 
     # canonicalize
     print(f"[prep] canonicalizing {len(raw)} samples ...")
