@@ -13,10 +13,10 @@ hf download bayang/shape processed --repo-type dataset --local-dir .
 hf download bayang/shape dataset --repo-type dataset --local-dir .
 
 # dry-run
-python train_supcon.py --dry-run
+python train.py --dry-run
 
 # full training (single GPU)
-CUDA_VISIBLE_DEVICES=0 python train_supcon.py --epochs 100 --batch-size 512
+CUDA_VISIBLE_DEVICES=0 python train.py --epochs 100 --batch-size 512
 ```
 
 ## Option B: Pull raw data, generate everything from scratch
@@ -31,20 +31,20 @@ python prepare_dataset.py --input dataset_output/dataset.json
 python preprocess_to_pt.py
 
 # step 3: train
-CUDA_VISIBLE_DEVICES=0 python train_supcon.py --epochs 100 --batch-size 512
+CUDA_VISIBLE_DEVICES=0 python train.py --epochs 100 --batch-size 512
 ```
 
 ## Training options
 
 ```bash
 # pick a specific GPU
-CUDA_VISIBLE_DEVICES=2 python train_supcon.py --epochs 100 --batch-size 512
+CUDA_VISIBLE_DEVICES=2 python train.py --epochs 100 --batch-size 512
 
 # tweak arc positive tolerance
-python train_supcon.py --delta-deg 20 --epochs 100 --batch-size 256
+python train.py --delta-deg 20 --epochs 100 --batch-size 256
 
 # smaller batch if GPU memory is tight
-python train_supcon.py --epochs 100 --batch-size 128
+python train.py --device cuda:0 --epochs 100 --batch-size 128
 ```
 
 ## Output
