@@ -71,7 +71,8 @@ def load_raw(path: str) -> List[Dict[str, Any]]:
 _ARC_RE = re.compile(r"^arc_(\d+)$")
 
 def _parse_category(cat: str) -> Tuple[str, int]:
-    """Return (motif_type, arc_angle_deg)."""
+    """Return (motif_type, arc_angle_deg).
+    """
     m = _ARC_RE.match(cat)
     if m:
         return "arc", int(m.group(1))
@@ -79,10 +80,8 @@ def _parse_category(cat: str) -> Tuple[str, int]:
         return "straight", -1
     if cat == "corner":
         return "corner", -1
-    if cat == "junction_T":
-        return "junction_T", -1
-    if cat == "junction_Y":
-        return "junction_Y", -1
+    if cat in ("junction_T", "junction_Y"):
+        return "junction", -1
     return cat, -1
 
 
@@ -117,6 +116,10 @@ def canonicalize(sample: Dict[str, Any]) -> Dict[str, Any] | None:
     """
     category = sample["category"]
     motif_type, arc_angle_deg = _parse_category(category)
+
+    # rewrite junction_T / junction_Y -> junction
+    if category in ("junction_T", "junction_Y"):
+        category = "junction"
 
     # --- nodes: convert & center ---
     nodes = np.asarray(sample["nodes"], dtype=np.float64)
@@ -255,6 +258,15 @@ def main() -> None:
 
     if n_drop > 0:
         print(f"[warn] {n_drop} samples failed validation and were skipped")
+
+    # hard-fail: no old junction_T / junction_Y labels may survive
+    _BANNED = {"junction_T", "junction_Y"}
+    for cat, records in by_cat.items():
+        assert cat not in _BANNED, f"FATAL: category '{cat}' still exists after merge!"
+        for r in records:
+            assert r["motif_type"] not in _BANNED, \
+                f"FATAL: motif_type '{r['motif_type']}' still exists after merge!"
+    print("[check] no junction_T / junction_Y labels remain -- OK")
 
     # split
     train, val, test = stratified_split(by_cat, ratios, seed=args.seed)

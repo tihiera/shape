@@ -12,26 +12,26 @@ Writes:  processed/train.pt
          processed/meta.json   (copy + augmented with feature info)
 
 Each .pt contains a list[Data] where every Data has:
-    x             (N, 3)   node features: [curvature, bend_rad, degree]
+    x             (N, 2)   node features: [curvature, degree]
     pos           (N, 3)   centred 3D coordinates
     edge_index    (2, 2E)  undirected COO
-    motif_type_id (int)    0=arc, 1=corner, 2=junction_T, 3=junction_Y, 4=straight
+    motif_type_id (int)    0=arc, 1=corner, 2=junction, 3=straight
     arc_angle_deg (int)    10..170 for arcs, -1 otherwise
 
 Usage
 ─────
-    python preprocess_to_pt.py                        # defaults
-    python preprocess_to_pt.py --jsonl-dir dataset    # custom JSONL root
-    python preprocess_to_pt.py --outdir processed     # custom output
+    python preprocess_to_pt.py
+    python preprocess_to_pt.py --jsonl-dir dataset
+    python preprocess_to_pt.py --outdir processed
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from pathlib import Path
+from collections import Counter
 from typing import Dict, List, Any
 
 import numpy as np
@@ -71,13 +71,14 @@ def record_to_data(rec: Dict[str, Any],
     """
     Convert one canonical JSONL record into a PyG Data object.
 
-    Node features x = [curvature, bend_rad, degree]
-      - curvature:  from features.curvature
-      - bend_rad:   radians(180 - segment_angle_deg)  = radians(bend_deg)
-      - degree:     from features.degree
+    Node features x = [curvature, degree]
+      - curvature:  from features.curvature  (geometric signal)
+      - degree:     from features.degree     (topological signal)
+
+    No bend_rad / bend_deg — those encode the answer too directly.
+    The model must learn geometry from positions + edge structure.
     """
     nodes = np.asarray(rec["nodes"], dtype=np.float32)       # (N, 3)
-    n = len(nodes)
 
     # pos (already centred by prepare_dataset.py)
     pos = torch.tensor(nodes, dtype=torch.float)
@@ -86,16 +87,14 @@ def record_to_data(rec: Dict[str, Any],
     edges = rec["edges"]  # list of [u, v]
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()  # (2, 2E)
 
-    # node features
+    # node features: curvature + degree only
     curvature = np.asarray(rec["features"]["curvature"], dtype=np.float32)
-    bend_deg = np.asarray(rec["features"]["bend_deg"], dtype=np.float32)
-    bend_rad = np.deg2rad(bend_deg).astype(np.float32)
     degree = np.asarray(rec["features"]["degree"], dtype=np.float32)
 
     x = torch.tensor(
-        np.column_stack([curvature, bend_rad, degree]),
+        np.column_stack([curvature, degree]),
         dtype=torch.float,
-    )  # (N, 3)
+    )  # (N, 2)
 
     # labels
     motif_type_id = motif_type_to_id[rec["motif_type"]]
@@ -112,6 +111,8 @@ def record_to_data(rec: Dict[str, Any],
 
 # ─── main ────────────────────────────────────────────────────────────
 
+_BANNED_MOTIFS = {"junction_T", "junction_Y"}
+
 def main() -> None:
     args = parse_args()
     jsonl_root = Path(args.jsonl_dir)
@@ -125,6 +126,11 @@ def main() -> None:
     motif_type_to_id: Dict[str, int] = meta["motif_type_to_id"]
     print(f"[meta] motif_type_to_id = {motif_type_to_id}")
 
+    # hard-fail: old labels must not exist in meta
+    for banned in _BANNED_MOTIFS:
+        assert banned not in motif_type_to_id, \
+            f"FATAL: '{banned}' still in motif_type_to_id! Re-run prepare_dataset.py first."
+
     # process each split
     for split in ("train", "val", "test"):
         split_dir = jsonl_root / split
@@ -136,9 +142,22 @@ def main() -> None:
         records = load_jsonl_split(split_dir)
         print(f"[{split}] loaded {len(records)} records in {time.time()-t0:.1f}s")
 
+        # hard-fail: no old labels in records
+        motif_counts = Counter(r["motif_type"] for r in records)
+        for banned in _BANNED_MOTIFS:
+            assert motif_counts.get(banned, 0) == 0, \
+                f"FATAL: {split} contains {motif_counts[banned]} samples with motif_type='{banned}'!"
+        print(f"[{split}] motif distribution: {dict(motif_counts)}")
+
         t0 = time.time()
         data_list = [record_to_data(r, motif_type_to_id) for r in records]
         print(f"[{split}] converted {len(data_list)} Data objects in {time.time()-t0:.1f}s")
+
+        # hard-fail: verify motif_type_id values are valid
+        valid_ids = set(motif_type_to_id.values())
+        actual_ids = {d.motif_type_id for d in data_list}
+        bad_ids = actual_ids - valid_ids
+        assert not bad_ids, f"FATAL: {split} has invalid motif_type_ids: {bad_ids}"
 
         pt_path = out / f"{split}.pt"
         torch.save(data_list, pt_path)
@@ -146,8 +165,8 @@ def main() -> None:
         print(f"[{split}] saved {pt_path}  ({size_mb:.1f} MB)")
 
     # copy + augment meta
-    meta["node_features_pt"] = ["curvature", "bend_rad", "degree"]
-    meta["node_feature_dim_pt"] = 3
+    meta["node_features_pt"] = ["curvature", "degree"]
+    meta["node_feature_dim_pt"] = 2
     out_meta = out / "meta.json"
     with open(out_meta, "w") as f:
         json.dump(meta, f, indent=2)
@@ -155,8 +174,8 @@ def main() -> None:
 
     # sample check
     d = data_list[0]
-    print(f"\n── sample (first from {split}) ──")
-    print(f"  x            : {d.x.shape}")
+    print(f"\n── sample (first from last split) ──")
+    print(f"  x            : {d.x.shape}  (curvature, degree)")
     print(f"  pos          : {d.pos.shape}")
     print(f"  edge_index   : {d.edge_index.shape}")
     print(f"  motif_type_id: {d.motif_type_id}")

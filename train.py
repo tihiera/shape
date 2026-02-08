@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from pathlib import Path
 from collections import defaultdict
@@ -84,16 +83,18 @@ class ShapeEncoder(nn.Module):
     Architecture:
         node MLP -> [GATv2 + residual] x L
         -> AttentionalAggregation pool
-        -> concat global features (num_nodes, total_bend)
+        -> concat num_nodes (graph-level scalar)
         -> projection MLP -> L2 norm
+
+    Node features x = [curvature, degree].
+    No bend_rad / total_bend -- model must learn geometry from
+    positions + edge structure, not pre-solved labels.
     """
 
-    def __init__(self, in_dim: int = 3, hidden_dim: int = 128,
+    def __init__(self, in_dim: int = 2, hidden_dim: int = 128,
                  embed_dim: int = 256, heads: int = 4,
-                 num_layers: int = 4, dropout: float = 0.1,
-                 n_global_feats: int = 2):
+                 num_layers: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.n_global_feats = n_global_feats
 
         # node encoder
         self.node_enc = nn.Sequential(
@@ -123,7 +124,7 @@ class ShapeEncoder(nn.Module):
             else:
                 self.res_projs.append(nn.Identity())
 
-        # attentional aggregation pooling (replaces deprecated GlobalAttention)
+        # attentional aggregation pooling
         gate_nn = nn.Sequential(
             nn.Linear(hidden_dim * heads, hidden_dim),
             nn.ReLU(),
@@ -131,8 +132,8 @@ class ShapeEncoder(nn.Module):
         )
         self.pool = AttentionalAggregation(gate_nn)
 
-        # projection head: pool_dim + global features -> embed_dim
-        pool_dim = hidden_dim * heads + n_global_feats
+        # projection head: pool_dim + 1 global feat (num_nodes) -> embed_dim
+        pool_dim = hidden_dim * heads + 1
         self.proj = nn.Sequential(
             nn.Linear(pool_dim, hidden_dim * heads),
             nn.ReLU(),
@@ -158,21 +159,13 @@ class ShapeEncoder(nn.Module):
         # ── pool ──
         g = self.pool(h, index=batch)  # (B, hidden*heads)
 
-        # ── global features: num_nodes + total_bend per graph ──
-        # bend_rad is x[:, 1] (second feature column)
-        bend_rad = x[:, 1]
+        # ── global feature: num_nodes per graph ──
         B = g.size(0)
         num_nodes = torch.zeros(B, device=g.device)
-        total_bend = torch.zeros(B, device=g.device)
         num_nodes.scatter_add_(0, batch, torch.ones_like(batch, dtype=torch.float))
-        total_bend.scatter_add_(0, batch, bend_rad)
+        num_nodes_norm = (num_nodes / 20.0).unsqueeze(1)  # (B, 1)
 
-        # normalise global features for stable training
-        num_nodes_norm = num_nodes / 20.0        # ~10-20 nodes, so /20 puts in [0.5, 1]
-        total_bend_norm = total_bend / math.pi   # total bend in radians, /pi normalises
-
-        global_feats = torch.stack([num_nodes_norm, total_bend_norm], dim=1)  # (B, 2)
-        g = torch.cat([g, global_feats], dim=1)  # (B, hidden*heads + 2)
+        g = torch.cat([g, num_nodes_norm], dim=1)  # (B, hidden*heads + 1)
 
         # ── project + L2 normalise ──
         z = self.proj(g)
