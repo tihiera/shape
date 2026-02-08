@@ -3,57 +3,48 @@
 ## Prerequisites
 
 ```bash
-pip install torch torch-geometric numpy
+pip install -r requirements.txt
 ```
 
-## 1. Pull the dataset from HuggingFace
+## Option A: Pull everything pre-computed, train directly
 
 ```bash
-# clone the dataset repo
-git clone https://huggingface.co/datasets/bayang/shape
-cd shape
-```
+hf download bayang/shape processed --repo-type dataset --local-dir .
+hf download bayang/shape dataset --repo-type dataset --local-dir .
 
-## 2. Prepare JSONL splits (if not already done)
-
-```bash
-python prepare_dataset.py --input dataset_output/dataset.json
-```
-
-Output: `dataset/train/*.jsonl`, `dataset/val/*.jsonl`, `dataset/test/*.jsonl`
-
-## 3. Convert to PyG .pt files
-
-```bash
-python preprocess_to_pt.py
-```
-
-Output: `processed/train.pt`, `processed/val.pt`, `processed/test.pt`, `processed/meta.json`
-
-## 4. Train
-
-### Dry-run (50 steps, diagnostics)
-
-```bash
+# dry-run
 python train_supcon.py --dry-run
-```
 
-### Single GPU
-
-```bash
+# full training (single GPU)
 CUDA_VISIBLE_DEVICES=0 python train_supcon.py --epochs 100 --batch-size 512
 ```
 
-### Pick a specific GPU
+## Option B: Pull raw data, generate everything from scratch
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 python train_supcon.py --epochs 100 --batch-size 512
+hf download bayang/shape --repo-type dataset --local-dir .
+
+# step 1: raw JSON → JSONL splits
+python prepare_dataset.py --input dataset_output/dataset.json
+
+# step 2: JSONL → PyG .pt files
+python preprocess_to_pt.py
+
+# step 3: train
+CUDA_VISIBLE_DEVICES=0 python train_supcon.py --epochs 100 --batch-size 512
 ```
 
-### Tweak arc positive tolerance
+## Training options
 
 ```bash
+# pick a specific GPU
+CUDA_VISIBLE_DEVICES=2 python train_supcon.py --epochs 100 --batch-size 512
+
+# tweak arc positive tolerance
 python train_supcon.py --delta-deg 20 --epochs 100 --batch-size 256
+
+# smaller batch if GPU memory is tight
+python train_supcon.py --epochs 100 --batch-size 128
 ```
 
 ## Output
