@@ -2,6 +2,10 @@
 
 Synthetic graph-based centerline representations of 3D geometric motifs (pipe-like structures).
 
+> 🚀 **Backend API & Gemini 3 integration**: see [`deploy/README.md`](./deploy/README.md) for the full server documentation, endpoints, and how we use Gemini 3 Flash.
+>
+> 📐 **Architecture deep-dive**: see [`deploy/ARCHITECTURE.md`](./deploy/ARCHITECTURE.md) for system diagrams, data flows, and the Gemini function-calling pipeline.
+
 ### The links
 Available at https://github.com/tihiera/shape-frontend
 Datasets is available at https://huggingface.co/datasets/bayang/shape

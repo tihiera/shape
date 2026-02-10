@@ -3,6 +3,8 @@
 FastAPI server: **STEP/JSON → centerline → segment → query**.
 Detects **junctions**, **straights**, **arcs**, and **corners**.
 
+> 📐 **Full architecture documentation**: see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for detailed diagrams, data flows, and Gemini 3 integration deep-dive.
+
 ## Quick Start
 
 ```bash
@@ -146,39 +148,75 @@ ws.send(JSON.stringify({
 }));
 ```
 
-## AI-Powered Queries (Gemini)
+## How We Use Gemini 3 Flash
 
-Queries use **Gemini 2.0 Flash** with function calling. The LLM:
-- Understands natural language and maps it to tool calls
-- Chains multiple tools for complex queries
-- Provides natural language explanations of results
-- Falls back to rule-based parsing if Gemini is unavailable
+> For the full deep-dive with diagrams, see [`ARCHITECTURE.md` → "How We Use Gemini 3 Flash"](./ARCHITECTURE.md#how-we-use-gemini-3-flash)
 
-```bash
-export GEMINI_API_KEY=your_key_here
+**Gemini 3 Flash** (`gemini-3-flash-preview` via `google-genai` Python SDK) is the core intelligence layer. It replaces what would traditionally be a brittle rule-based NLP parser with a context-aware AI agent that can reason over geometry data.
+
+### Function Calling (Tool Use)
+
+We define **8 DSL tools** as Gemini function declarations. When a user asks a question in natural language, Gemini autonomously decides which tools to call and in what order:
+
+```
+User: "Find all arcs above 60° and highlight the sharpest one"
+
+  Round 1 → Gemini calls: filter_segments(type="arc", arc_angle_deg__gt=60)
+  Round 2 → Gemini calls: topk_by(field="arc_angle_deg", k=1)
+  Round 3 → Gemini calls: highlight_segments(segment_ids=[9])
+  Round 4 → Gemini generates answer:
+            "There are 4 arcs above 60°. The sharpest is Segment #9,
+             a 180° U-bend. I've highlighted it for you."
 ```
 
-### Example complex queries the AI handles:
+Each round, Gemini receives the tool result and decides whether to call another tool or produce a final answer. Up to 8 rounds per query.
 
-| Query | What happens |
-|-------|-------------|
+### Conversation Context & Follow-ups
+
+Chat history (including previous tool calls and results) is injected into every Gemini request, enabling natural follow-ups:
+
+```
+User: "how many arcs above 40°?"     → Gemini calls filter_segments → "6 arcs"
+User: "and above 80°?"               → Gemini understands context → "3 arcs"
+User: "does it contain straights?"   → Gemini switches type → "7 straight sections"
+```
+
+### 8 DSL Tools Available to Gemini
+
+| Tool | Purpose | Example Trigger |
+|------|---------|----------------|
+| `list_segments` | Overview of all segments | "describe this geometry" |
+| `filter_segments` | Filter by type/angle/length/curvature | "show arcs above 90°" |
+| `count_segments` | Count (optionally filtered) | "how many straights?" |
+| `sum_field` | Sum a numeric field | "total length of all arcs" |
+| `group_by` | Group by type with stats | "break down by type" |
+| `topk_by` | Top-K by any numeric field | "3 sharpest bends" |
+| `describe_segment` | Full detail of one segment | "tell me about segment #5" |
+| `highlight_segments` | Highlight in 3D viewer | "highlight the U-bends" |
+
+### Configuration
+
+```bash
+# .env file in deploy/
+GEMINI_API_KEY=your_key_here
+GEMINI_MODEL=gemini-3-flash-preview   # default
+```
+
+| Setting | Value |
+|---------|-------|
+| Model | `gemini-3-flash-preview` |
+| SDK | `google-genai` (Python) |
+| Temperature | `0.1` (deterministic, factual) |
+| Max tool rounds | `8` per query |
+
+### Example Complex Queries
+
+| Query | What Gemini Does |
+|-------|-----------------|
 | "Find all arcs > 30° and highlight the longest one" | filter → topk → highlight (3 tool calls) |
 | "Compare the total length of straights vs arcs" | sum(straight) + sum(arc) (2 tool calls) |
 | "What's the sharpest corner and where is it?" | topk_by(corner_angle) → describe → highlight |
 | "Give me an overview of the pipe layout" | group_by + list_segments |
-
-### DSL Tools (called by Gemini)
-
-| Tool | Description |
-|------|-------------|
-| `list_segments` | Show all segments |
-| `filter_segments` | Filter by type, angle, length, curvature |
-| `count_segments` | Count segments (optionally filtered) |
-| `sum_field` | Sum a numeric field |
-| `group_by` | Group by any field |
-| `topk_by` | Top-K by any numeric field |
-| `describe_segment` | Full detail of one segment |
-| `highlight_segments` | Highlight for VTK.js overlay |
 
 ## Auth Flow (No Auth Service)
 
@@ -232,19 +270,22 @@ deploy/
 ├── inference.py                # ML embedding (standalone)
 ├── model.py                    # ShapeEncoder GATv2 (standalone)
 ├── ai/
-│   ├── gemini.py               # Gemini client + function calling
-│   └── prompts.py              # System prompts + context builder
+│   ├── gemini.py               # Gemini 3 client + function calling + multi-turn
+│   ├── prompts.py              # System prompts + context builder
+│   └── test_gemini.py          # Integration tests
 ├── dsl/
-│   └── engine.py               # DSL executor + AI query + rule fallback
+│   └── engine.py               # DSL executor + Gemini-powered query_smart()
 ├── services/
-│   ├── geometry_ingest.py      # STEP/JSON ingest
+│   ├── geometry_ingest.py      # STEP/MSH/JSON ingest + centerline extraction
 │   ├── segmentation.py         # Pipeline orchestrator
 │   └── session.py              # User/session management
 ├── weights/
 │   ├── encoder.pt              # Trained model
 │   └── meta.json               # Model metadata
+├── mesh/                       # Test pipe meshes (5 types)
 ├── requirements.txt
 ├── Dockerfile
+├── ARCHITECTURE.md             # Full architecture docs + Gemini deep-dive
 └── README.md
 ```
 
