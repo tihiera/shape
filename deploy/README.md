@@ -1,4 +1,4 @@
-# Centerline Segmentation API v2
+# Centerline Segmentation API
 
 FastAPI server: **STEP/JSON → centerline → segment → query**.
 Detects **junctions**, **straights**, **arcs**, and **corners**.

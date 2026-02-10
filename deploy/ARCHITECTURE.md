@@ -16,13 +16,13 @@ Our solution is a **full-stack pipeline** that ingests geometry, segments it, an
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           FRONTEND (React + VTK.js)                     │
-│                                                                         │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐  │
-│  │  Login    │  │  File Upload │  │  3D Mesh View │  │  Chat Panel  │  │
-│  │  (email)  │  │  (.msh/.step)│  │  (VTK.js)    │  │  (NL query)  │  │
-│  └────┬─────┘  └──────┬───────┘  └───────┬───────┘  └──────┬───────┘  │
+┌────────────────────────────────────────────────────────────────────────┐
+│                           FRONTEND (React + VTK.js)                    │
+│                                                                        │
+│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐   │
+│  │  Login   │  │  File Upload │  │  3D Mesh View │  │  Chat Panel  │   │
+│  │  (email) │  │  (.msh/.step)│  │  (VTK.js)     │  │  (NL query)  │   │
+│  └────┬─────┘  └──────┬───────┘  └───────┬───────┘  └───────┬──────┘   │
 │       │               │                  │                  │          │
 └───────┼───────────────┼──────────────────┼──────────────────┼──────────┘
         │               │                  │                  │
@@ -31,42 +31,42 @@ Our solution is a **full-stack pipeline** that ingests geometry, segments it, an
         │  /auth/login  │  /upload         │  /mesh/..        │
         ▼               ▼                  ▼                  ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        FastAPI SERVER (app.py)                           │
+│                        FastAPI SERVER (app.py)                          │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │                        REST Endpoints                           │    │
 │  │                                                                 │    │
-│  │  POST /auth/login       → Static email auth (no password)      │    │
-│  │  GET  /auth/me          → Validate UID, return user info       │    │
-│  │  POST /upload           → Ingest .msh/.step/.json file         │    │
-│  │  POST /query            → NL query → Gemini AI → answer        │    │
-│  │  GET  /mesh/{uid}/{sid} → Surface mesh (vertices + faces)      │    │
-│  │  GET  /chat/{uid}/{sid} → Chat history (messages array)        │    │
-│  │  GET  /segments/{uid}/{sid} → Segmentation results             │    │
-│  │  GET  /sessions/{uid}   → List all user sessions               │    │
+│  │  POST /auth/login       → Static email auth (no password)       │    │
+│  │  GET  /auth/me          → Validate UID, return user info        │    │
+│  │  POST /upload           → Ingest .msh/.step/.json file          │    │
+│  │  POST /query            → NL query → Gemini AI → answer         │    │
+│  │  GET  /mesh/{uid}/{sid} → Surface mesh (vertices + faces)       │    │
+│  │  GET  /chat/{uid}/{sid} → Chat history (messages array)         │    │
+│  │  GET  /segments/{uid}/{sid} → Segmentation results              │    │
+│  │  GET  /sessions/{uid}   → List all user sessions                │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                    WebSocket /ws/{uid}/{sid}                     │    │
+│  │                    WebSocket /ws/{uid}/{sid}                    │    │
 │  │                                                                 │    │
-│  │  Client → {"type": "upload_and_segment"}                       │    │
-│  │  Server ← {"type": "progress", "step": "segmenting", ...}     │    │
-│  │  Server ← {"type": "progress", "step": "downsampling", ...}   │    │
-│  │  Server ← {"type": "result", "data": {segments, summary}}     │    │
+│  │  Client → {"type": "upload_and_segment"}                        │    │
+│  │  Server ← {"type": "progress", "step": "segmenting", ...}       │    │
+│  │  Server ← {"type": "progress", "step": "downsampling", ...}     │    │
+│  │  Server ← {"type": "result", "data": {segments, summary}}       │    │
 │  │                                                                 │    │
-│  │  Client → {"type": "query", "query": "how many arcs > 90°?"}  │    │
-│  │  Server ← {"type": "progress", "step": "tool_call", ...}      │    │
-│  │  Server ← {"type": "result", "data": {answer, tool_calls}}    │    │
+│  │  Client → {"type": "query", "query": "how many arcs > 90°?"}    │    │
+│  │  Server ← {"type": "progress", "step": "tool_call", ...}        │    │
+│  │  Server ← {"type": "result", "data": {answer, tool_calls}}      │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  │
-│  │  Telegram     │  │  services/   │  │    dsl/      │  │    ai/    │  │
-│  │  Notifier     │  │              │  │              │  │           │  │
-│  └──────────────┘  └──────┬───────┘  └──────┬───────┘  └─────┬─────┘  │
-│                           │                 │                 │        │
-└───────────────────────────┼─────────────────┼─────────────────┼────────┘
-                            │                 │                 │
-                            ▼                 ▼                 ▼
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────┐    │
+│  │  Notifier    │  │  services/   │  │    dsl/      │  │    ai/    │    │
+│  │              │  │              │  │              │  │           │    │
+│  └──────────────┘  └──────┬───────┘  └──────┬───────┘  └─────┬─────┘    │
+│                           │                 │                │          │
+└───────────────────────────┼─────────────────┼────────────────┼──────────┘
+                            │                 │                │
+                            ▼                 ▼                ▼
 ```
 
 ---
@@ -88,7 +88,7 @@ Our solution is a **full-stack pipeline** that ingests geometry, segments it, an
 └─────────┬───────────────────┘
           │
           ▼
-┌─────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────┐
 │  Centerline Extraction                           │
 │                                                  │
 │  Single-layer mesh?                              │
@@ -98,7 +98,7 @@ Our solution is a **full-stack pipeline** that ingests geometry, segments it, an
 │  └─ NO  → extract_centerline_from_mesh()         │
 │           (VMTK: boundary loops → seed points    │
 │            → vmtkcenterlines → polyline output)  │
-└─────────┬───────────────────────────────────────┘
+└─────────┬────────────────────────────────────────┘
           │
           ▼
 ┌─────────────────────────────┐
@@ -191,10 +191,10 @@ Downsampled segment (16 nodes, edges)
 │  ShapeEncoder (GATv2)               │
 │                                     │
 │  Node features: [curvature, degree] │
-│  → Node MLP (2 → 128)              │
-│  → 4× GATv2Conv (4 heads, residual)│
+│  → Node MLP (2 → 128)               │
+│  → 4× GATv2Conv (4 heads, residual) │
 │  → AttentionalAggregation pool      │
-│  → Projection MLP → 256-dim        │
+│  → Projection MLP → 256-dim         │
 │  → L2 normalize                     │
 │                                     │
 │  Output: 256-dim embedding vector   │
@@ -229,7 +229,7 @@ Gemini 3 Flash (`gemini-3-flash-preview`) is the **core intelligence layer** of 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         ai/ MODULE                                   │
+│                         ai/ MODULE                                  │
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────────┐    │
 │  │  gemini.py — Gemini Client Wrapper                          │    │
