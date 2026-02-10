@@ -1,9 +1,13 @@
-# Shape Geometry Dataset
+# Shape Geometry
 
 Synthetic graph-based centerline representations of 3D geometric motifs (pipe-like structures).
 
-## JSON Schema
+### The links
+Available at https://github.com/tihiera/shape-frontend
+Datasets is available at https://huggingface.co/datasets/bayang/shape
 
+## JSON Schema
+ 
 `dataset.json` is an array of shape records. Each record:
 
 ```json
@@ -77,3 +81,4 @@ python generate_geometry_dataset.py
 ```
 
 Generates 10000 samples per category (17 arc classes + straight + corner + junction_T + junction_Y = 21 raw categories, merged to 20 for training).
+
