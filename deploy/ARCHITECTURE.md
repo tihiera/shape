@@ -342,7 +342,7 @@ The system prompt (`ai/prompts.py`) provides Gemini with:
 
 ## Sample Meshes
 
-Pre-built Gmsh 4.1 `.msh` pipe network samples are available in `samples/` for testing and demonstration:
+Pre-built Gmsh `.msh` pipe network samples are available in `samples/` for testing and demonstration:
 
 | File | Description | Geometry | Size |
 |------|-------------|----------|------|
@@ -352,7 +352,6 @@ Pre-built Gmsh 4.1 `.msh` pipe network samples are available in `samples/` for t
 | `t_junction.msh` | T-junction (3-way split) | 1 junction + 3 branches | 401 KB |
 | `complex_network.msh` | Multi-branch pipe network | Multiple junctions, bends, straights, and corners | 1.4 MB |
 
-These files exercise the full pipeline (ingest → centerline extraction → segmentation → query). Upload via `POST /upload` or the frontend file picker.
 
 ---
 
