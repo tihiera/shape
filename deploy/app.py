@@ -49,7 +49,7 @@ except ImportError:
 import numpy as np
 from pydantic import BaseModel, Field
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from centerline_segmenter import (
@@ -67,6 +67,8 @@ from services.geometry_ingest import ingest_file, read_centerline_json
 from services.segmentation import run_full_pipeline, load_session_results
 from dsl.engine import SegmentQueryEngine, query_smart
 from ai.prompts import format_step_explanation, summarize_pipeline_intro
+from telegram import Bot
+from telegram.constants import ParseMode
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -75,6 +77,39 @@ from ai.prompts import format_step_explanation, summarize_pipeline_intro
 
 _MODEL = None
 _DEVICE = None
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not TOKEN or not CHAT_ID:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+
+bot = Bot(token=TOKEN)
+async def send_telegram_message(message: str):
+    try:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        print("[telegram] ✅ Message sent")
+    except Exception as e:
+        print(f"[telegram] ❌ Error sending message: {e}")
+        return False
+    return True
+
+
+def _tg_notify(message: str):
+    """Fire-and-forget telegram notification (safe from sync or async context)."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(send_telegram_message(message))
+        else:
+            loop.run_until_complete(send_telegram_message(message))
+    except Exception as e:
+        print(f"[telegram] ❌ Could not schedule message: {e}")
 
 
 def _load_ml_model():
@@ -322,11 +357,11 @@ def segment_inline(data: SegmentRequest):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES: QUERY (NL -> AI -> execute)
+# ROUTES: QUERY (NL -> AI -> execute) 
 # ══════════════════════════════════════════════════════════════════════
 
 @app.post("/query")
-def query_segments(req: QueryRequest):
+def query_segments(req: QueryRequest, background_tasks: BackgroundTasks):
     """NL query on session segments. Uses Gemini AI with function calling."""
     _require_uid(req.uid)
 
@@ -344,6 +379,15 @@ def query_segments(req: QueryRequest):
     # Append user message to persistent log
     append_chat(session_dir, "user", req.query)
 
+    # Notify: user asked a question
+    user = get_user_by_uid(req.uid)
+    email = user.get("email", req.uid) if user else req.uid
+    _tg_notify(
+        f"❓ *Question* from `{email}`\n"
+        f"• Session: `{req.session_id}`\n"
+        f"• Query: _{req.query}_"
+    )
+
     ai_result = query_smart(
         user_message=req.query,
         segments=results["segments"],
@@ -356,6 +400,14 @@ def query_segments(req: QueryRequest):
                     "tool_calls": ai_result.get("tool_calls", []),
                     "mode": ai_result.get("mode", "unknown"),
                 })
+
+    # Notify: answer generated
+    answer_preview = ai_result.get("answer", "")[:200]
+    _tg_notify(
+        f"✅ *Answer* for `{email}`\n"
+        f"• Mode: `{ai_result.get('mode', 'unknown')}`\n"
+        f"• Answer: _{answer_preview}_"
+    )
 
     return {
         "query": req.query,
@@ -634,6 +686,15 @@ async def websocket_pipeline(ws: WebSocket, uid: str, session_id: str):
                     # 2. Now append the user message to the persistent chat log
                     append_chat(session_dir, "user", query_text)
 
+                    # Notify: user asked a question
+                    ws_user = get_user_by_uid(uid)
+                    ws_email = ws_user.get("email", uid) if ws_user else uid
+                    await send_telegram_message(
+                        f"❓ *Question* from `{ws_email}`\n"
+                        f"• Session: `{session_id}`\n"
+                        f"• Query: _{query_text}_"
+                    )
+
                     await send("progress", step="parsing_query",
                                detail={"query": query_text},
                                explanation=format_step_explanation("parsing_query", {"query": query_text}))
@@ -672,6 +733,14 @@ async def websocket_pipeline(ws: WebSocket, uid: str, session_id: str):
                                     "tool_calls": ai_result.get("tool_calls", []),
                                     "mode": ai_result.get("mode"),
                                 })
+
+                    # Notify: answer generated
+                    answer_preview = ai_result.get("answer", "")[:200]
+                    await send_telegram_message(
+                        f"✅ *Answer* for `{ws_email}`\n"
+                        f"• Mode: `{ai_result.get('mode', 'unknown')}`\n"
+                        f"• Answer: _{answer_preview}_"
+                    )
 
                     await send("result", data={
                         "query": query_text,
