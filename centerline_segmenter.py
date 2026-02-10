@@ -39,13 +39,14 @@ class Branch:
 @dataclass
 class SegmentRecord:
     segment_id: int
-    type: str                    # "junction" | "straight" | "arc"
+    type: str                    # "junction" | "straight" | "arc" | "corner"
     node_ids_original: List[int]
     length: float
     mean_curvature: float
     max_curvature: float
     arc_angle_deg: float = 0.0
     radius_est: float = 0.0
+    corner_angle_deg: float = 0.0
 
 
 @dataclass
@@ -59,6 +60,9 @@ class SegmentParams:
     snap_window: int = 3         # snap boundary to nearest kappa minimum within ± this
     smooth_window: int = 3       # curvature smoothing kernel size
     junction_k_hops: int = 2     # hops around junction node to include
+    corner_max_length: float = 3.0
+    corner_min_angle: float = 20.0
+    corner_sharpness: float = 5.0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -805,9 +809,20 @@ def split_centerline_graph(
             )
 
             if label == "arc":
-                rec.arc_angle_deg = estimate_arc_angle(seg_pts)
+                angle = estimate_arc_angle(seg_pts)
+                rec.arc_angle_deg = angle
                 if mean_k > 1e-8:
                     rec.radius_est = 1.0 / mean_k
+
+                is_short = seg_len <= params.corner_max_length
+                has_angle = angle >= params.corner_min_angle
+                is_sharp = (max_k / max(mean_k, 1e-9)) >= params.corner_sharpness
+                angle_density = angle / max(seg_len, 1e-9)
+                is_dense_turn = angle_density > 30.0
+
+                if is_short and has_angle and (is_sharp or is_dense_turn):
+                    rec.type = "corner"
+                    rec.corner_angle_deg = angle
 
             curve_segments.append(rec)
             seg_id += 1
@@ -858,7 +873,7 @@ def segments_to_json(segments: List[SegmentRecord]) -> List[Dict[str, Any]]:
         d = asdict(s)
         # round floats
         for k in ("length", "mean_curvature", "max_curvature",
-                   "arc_angle_deg", "radius_est"):
+                   "arc_angle_deg", "radius_est", "corner_angle_deg"):
             if k in d:
                 d[k] = round(d[k], 4)
         out.append(d)

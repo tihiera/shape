@@ -1,31 +1,55 @@
 #!/usr/bin/env python3
 """
-FastAPI server for centerline segmentation + embedding inference.
+app.py — FastAPI server for centerline segmentation + query.
+
+Auth:
+    POST /auth/login              -> Email login (creates user if new)
+    GET  /auth/me?uid=...         -> Get user info + session history
 
 Pipeline:
-    1. Upload graph (nodes + edges)
-    2. Split into segments (junction / straight / arc)
-    3. Downsample each segment to ~16 nodes (uniform arc-length)
-    4. (Optional) Embed each segment with trained ShapeEncoder
-    5. Return typed segments with angle, curvature, radius, embeddings
+    POST /upload                  -> Ingest STEP/JSON file
+    POST /segment                 -> Run segmentation on uploaded graph
+    POST /query                   -> NL -> AI -> execute -> result
+    POST /dsl                     -> Execute DSL command directly
+
+Sessions:
+    GET  /sessions/{uid}          -> List sessions
+    GET  /session/{uid}/{sid}     -> Get full session (results + chat)
+    GET  /chat/{uid}/{sid}        -> Get chat messages only
+    GET  /segments/{uid}/{sid}    -> Get segmentation results only
+
+Streaming:
+    WS   /ws/{uid}/{session_id}   -> Streaming pipeline + chat
 
 Start:
     uvicorn app:app --host 0.0.0.0 --port 8000
-    # or
-    python app.py
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+# Load .env file (must be before any code that reads env vars)
+try:
+    from dotenv import load_dotenv
+    _env_file = Path(__file__).resolve().parent / ".env"
+    if _env_file.exists():
+        load_dotenv(_env_file)
+        print(f"[app] 📄 Loaded .env from {_env_file}")
+    else:
+        load_dotenv()
+except ImportError:
+    pass
 
 import numpy as np
 from pydantic import BaseModel, Field
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from centerline_segmenter import (
@@ -34,46 +58,53 @@ from centerline_segmenter import (
     estimate_arc_angle,
     SegmentParams,
 )
+from services.session import (
+    login_or_create_user, get_user_by_uid, validate_uid,
+    create_session, get_session_dir, list_sessions,
+    append_chat, load_chat,
+)
+from services.geometry_ingest import ingest_file, read_centerline_json
+from services.segmentation import run_full_pipeline, load_session_results
+from dsl.engine import SegmentQueryEngine, query_smart
+from ai.prompts import format_step_explanation, summarize_pipeline_intro
 
-# ── optional: ML embedding (gracefully skip if torch not installed) ──
+
+# ══════════════════════════════════════════════════════════════════════
+# ML MODEL (optional)
+# ══════════════════════════════════════════════════════════════════════
+
 _MODEL = None
 _DEVICE = None
+
 
 def _load_ml_model():
     global _MODEL, _DEVICE
     if _MODEL is not None:
         return
 
-    ckpt_path = os.environ.get("MODEL_CHECKPOINT", "weights/encoder.pt")
-    if not Path(ckpt_path).exists():
-        print(f"[model] checkpoint not found at {ckpt_path}, embedding disabled")
+    ckpt = os.environ.get("MODEL_CHECKPOINT", "weights/encoder.pt")
+    if not Path(ckpt).exists():
+        print(f"[model] checkpoint not found at {ckpt}, embedding disabled")
         return
-
     try:
         from inference import load_model, pick_device
         _DEVICE = pick_device(os.environ.get("DEVICE", "auto"))
-        _MODEL, _ = load_model(ckpt_path, _DEVICE)
-        print(f"[model] loaded from {ckpt_path} on {_DEVICE}")
+        _MODEL, _ = load_model(ckpt, _DEVICE)
+        print(f"[model] loaded on {_DEVICE}")
     except ImportError:
-        print("[model] torch/torch_geometric not installed, embedding disabled")
+        print("[model] torch not installed, embedding disabled")
     except Exception as e:
-        print(f"[model] failed to load: {e}")
+        print(f"[model] load failed: {e}")
 
 
-def _embed_segment(ds_pts: np.ndarray, ds_edges: List[List[int]]) -> Optional[List[float]]:
-    """Embed a downsampled segment. Returns None if model not available."""
-    if _MODEL is None or _DEVICE is None:
-        return None
-    if len(ds_pts) < 3:
-        return None
+# ══════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════
 
-    try:
-        from inference import graph_to_pyg, embed_one
-        data = graph_to_pyg(ds_pts.astype(np.float32), ds_edges)
-        emb = embed_one(_MODEL, data, _DEVICE)
-        return emb.tolist()
-    except Exception:
-        return None
+def _require_uid(uid: str):
+    """Validate that a uid exists. Raises 401 if not."""
+    if not uid or not validate_uid(uid):
+        raise HTTPException(401, "Invalid or unknown uid. Call POST /auth/login first.")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -82,8 +113,12 @@ def _embed_segment(ds_pts: np.ndarray, ds_edges: List[List[int]]) -> Optional[Li
 
 app = FastAPI(
     title="Centerline Segmentation API",
-    description="Detect junctions, straights, arcs in 3D centerline graphs. Optionally embed with trained GATv2 model.",
-    version="1.0.0",
+    description=(
+        "Ingest STEP/JSON geometry → extract centerline → "
+        "segment (junction/straight/arc/corner) → downsample → "
+        "embed → query via NL/DSL. WebSocket streaming for live updates."
+    ),
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -103,46 +138,57 @@ def startup():
 # SCHEMAS
 # ══════════════════════════════════════════════════════════════════════
 
-class GraphInput(BaseModel):
+class LoginRequest(BaseModel):
+    email: str = Field(..., description="User email address")
+
+
+class SegmentRequest(BaseModel):
     nodes: List[List[float]] = Field(..., description="Nx3 coordinates")
     edges: List[List[int]] = Field(..., description="Edge pairs [i, j]")
-    target_step: float = Field(1.0, description="Resampling step for curvature")
-    downsample_nodes: int = Field(16, description="Target nodes per segment")
-    embed: bool = Field(False, description="Run ML embedding on each segment")
+    target_step: float = Field(1.0)
+    downsample_nodes: int = Field(16)
+    embed: bool = Field(False)
+    uid: str = Field(...)
+    session_id: Optional[str] = Field(None)
 
 
-class SegmentOut(BaseModel):
-    segment_id: int
-    type: str
-    node_count: int
-    length: float
-    mean_curvature: float
-    max_curvature: float
-    arc_angle_deg: float
-    radius_est: float
-    downsampled_nodes: List[List[float]]
-    downsampled_edges: List[List[int]]
-    embedding: Optional[List[float]] = None
+class QueryRequest(BaseModel):
+    query: str = Field(..., description="Natural language query or DSL command")
+    uid: str = Field(...)
+    session_id: str = Field(...)
 
 
-class SegmentationResponse(BaseModel):
-    segments: List[SegmentOut]
-    summary: dict
+class DSLRequest(BaseModel):
+    action: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+    uid: str = Field(...)
+    session_id: str = Field(...)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ENDPOINTS
+# ROUTES: HEALTH
 # ══════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
     return {
         "service": "Centerline Segmentation API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "model_loaded": _MODEL is not None,
+        "segment_types": ["junction", "straight", "arc", "corner"],
         "endpoints": {
-            "POST /segment": "Segment a graph -> junctions/straights/arcs",
-            "GET /health": "Health check",
+            "POST /auth/login": "Login with email (creates user if new)",
+            "GET /auth/me?uid=...": "Get user info + sessions",
+            "POST /upload": "Upload MSH/STEP/JSON file",
+            "POST /segment": "Segment a graph (inline JSON)",
+            "POST /query": "NL query on segments",
+            "POST /dsl": "Execute DSL command directly",
+            "GET /mesh/{uid}/{session_id}": "Get surface mesh (vertices + faces)",
+            "GET /chat/{uid}/{session_id}": "Get saved chat messages",
+            "GET /segments/{uid}/{session_id}": "Get segmentation results",
+            "WS /ws/{uid}/{session_id}": "WebSocket streaming pipeline",
+            "GET /sessions/{uid}": "List user sessions",
+            "GET /session/{uid}/{session_id}": "Get full session (results + chat)",
         },
     }
 
@@ -152,73 +198,536 @@ def health():
     return {"status": "ok", "model_loaded": _MODEL is not None}
 
 
-@app.post("/segment", response_model=SegmentationResponse)
-def segment_graph(data: GraphInput):
-    """
-    Full pipeline: split -> classify -> downsample -> (optional) embed.
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES: AUTH (static email-based, no password)
+# ══════════════════════════════════════════════════════════════════════
 
-    Returns list of segments with type, angle, curvature, downsampled geometry.
+@app.post("/auth/login")
+def auth_login(req: LoginRequest):
     """
-    # Validate
+    Static login with email. No password, no auth service.
+
+    Frontend flow:
+      1. Check localStorage for stored email + uid
+      2. If missing → show login page → user enters email
+      3. POST /auth/login {"email": "alice@example.com"}
+      4. Backend:
+         - If email exists → update last_login, return uid + sessions
+         - If email is new → create uid + folder, return uid + empty sessions
+      5. Frontend stores {email, uid} in localStorage
+      6. All subsequent requests use uid
+
+    Returns:
+        {
+            "uid": "a1b2c3d4e5f6...",
+            "email": "alice@example.com",
+            "is_new": true/false,
+            "created_at": "...",
+            "last_login": "...",
+            "sessions": [...]
+        }
+    """
+    try:
+        user = login_or_create_user(req.email)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    sessions = list_sessions(user["uid"])
+
+    return {
+        **user,
+        "sessions": sessions,
+    }
+
+
+@app.get("/auth/me")
+def auth_me(uid: str):
+    """
+    Get user info by uid. Used by frontend on page load to verify
+    the stored uid is still valid.
+
+    Returns user info + session list, or 404 if uid unknown.
+    """
+    user = get_user_by_uid(uid)
+    if user is None:
+        raise HTTPException(404, "User not found. Please login again.")
+
+    sessions = list_sessions(uid)
+
+    return {
+        **user,
+        "sessions": sessions,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES: UPLOAD
+# ══════════════════════════════════════════════════════════════════════
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    uid: str = Form(...),
+    session_id: Optional[str] = Form(None),
+):
+    """Upload a STEP or JSON file. Creates a session and ingests the geometry."""
+    _require_uid(uid)
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in (".step", ".stp", ".json", ".msh"):
+        raise HTTPException(400, f"Unsupported file type: {suffix}. Use .msh, .step, .stp, or .json")
+
+    meta = create_session(uid, session_id)
+    session_dir = Path(meta["path"])
+
+    upload_path = session_dir / "upload" / file.filename
+    with open(upload_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    try:
+        ingest_result = ingest_file(str(upload_path), session_dir)
+    except Exception as e:
+        raise HTTPException(500, f"Ingest failed: {e}")
+
+    return {"session": meta, "ingest": ingest_result}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES: SEGMENT (inline JSON)
+# ══════════════════════════════════════════════════════════════════════
+
+@app.post("/segment")
+def segment_inline(data: SegmentRequest):
+    """Segment a graph provided inline as JSON."""
+    _require_uid(data.uid)
+
     nodes = np.asarray(data.nodes, dtype=np.float64)
     if nodes.ndim != 2 or nodes.shape[1] != 3:
         raise HTTPException(400, "nodes must be Nx3")
-    if len(data.edges) == 0:
-        raise HTTPException(400, "edges cannot be empty")
-
     edges = [(int(e[0]), int(e[1])) for e in data.edges]
 
-    # 1. Segment
-    params = SegmentParams(target_step=data.target_step)
-    try:
-        segments = split_centerline_graph(nodes, edges, params)
-    except Exception as e:
-        raise HTTPException(500, f"Segmentation failed: {e}")
+    meta = create_session(data.uid, data.session_id)
+    session_dir = Path(meta["path"])
 
-    # 2. Downsample + (optional) embed
-    output: List[SegmentOut] = []
-    for seg in segments:
-        seg_pts = nodes[seg.node_ids_original]
-        ds_pts, ds_edges = downsample_segment_for_model(
-            seg_pts, target_nodes=data.downsample_nodes
-        )
-
-        # Recompute arc angle on downsampled for consistency
-        ds_angle = estimate_arc_angle(ds_pts) if seg.type == "arc" else 0.0
-
-        embedding = None
-        if data.embed:
-            embedding = _embed_segment(ds_pts, ds_edges)
-
-        output.append(SegmentOut(
-            segment_id=seg.segment_id,
-            type=seg.type,
-            node_count=len(seg.node_ids_original),
-            length=round(seg.length, 3),
-            mean_curvature=round(seg.mean_curvature, 4),
-            max_curvature=round(seg.max_curvature, 4),
-            arc_angle_deg=round(seg.arc_angle_deg, 1),
-            radius_est=round(seg.radius_est, 1),
-            downsampled_nodes=[[round(v, 6) for v in pt] for pt in ds_pts.tolist()],
-            downsampled_edges=ds_edges,
-            embedding=embedding,
-        ))
-
-    # Summary
-    type_counts: dict = {}
-    for seg in segments:
-        type_counts[seg.type] = type_counts.get(seg.type, 0) + 1
-
-    return SegmentationResponse(
-        segments=output,
-        summary={
-            "total_segments": len(segments),
-            "counts_by_type": type_counts,
-            "input_nodes": len(nodes),
-            "input_edges": len(edges),
-            "model_available": _MODEL is not None,
-        },
+    result = run_full_pipeline(
+        nodes, edges, session_dir,
+        target_step=data.target_step,
+        target_nodes=data.downsample_nodes,
+        model=_MODEL if data.embed else None,
+        device=_DEVICE,
     )
+
+    return {"session": meta, **result}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES: QUERY (NL -> AI -> execute)
+# ══════════════════════════════════════════════════════════════════════
+
+@app.post("/query")
+def query_segments(req: QueryRequest):
+    """NL query on session segments. Uses Gemini AI with function calling."""
+    _require_uid(req.uid)
+
+    session_dir = get_session_dir(req.uid, req.session_id)
+    if not session_dir.exists():
+        raise HTTPException(404, f"Session not found: {req.session_id}")
+
+    results = load_session_results(session_dir)
+    if results is None:
+        raise HTTPException(400, "No segmentation results. Run /segment first.")
+
+    # Load chat BEFORE appending user message — so AI sees conversation context
+    chat_history = load_chat(session_dir)
+
+    # Append user message to persistent log
+    append_chat(session_dir, "user", req.query)
+
+    ai_result = query_smart(
+        user_message=req.query,
+        segments=results["segments"],
+        chat_history=chat_history,
+    )
+
+    # Save assistant response with tool_calls for follow-up context
+    append_chat(session_dir, "assistant", ai_result.get("answer", ""),
+                extra={
+                    "tool_calls": ai_result.get("tool_calls", []),
+                    "mode": ai_result.get("mode", "unknown"),
+                })
+
+    return {
+        "query": req.query,
+        "answer": ai_result.get("answer", ""),
+        "tool_calls": ai_result.get("tool_calls", []),
+        "highlight_ids": ai_result.get("highlight_ids", []),
+        "mode": ai_result.get("mode", "unknown"),
+        "fallback_reason": ai_result.get("fallback_reason"),
+    }
+
+
+@app.post("/dsl")
+def execute_dsl(req: DSLRequest):
+    """Execute a DSL command directly (no NL parsing)."""
+    _require_uid(req.uid)
+
+    session_dir = get_session_dir(req.uid, req.session_id)
+    if not session_dir.exists():
+        raise HTTPException(404, f"Session not found: {req.session_id}")
+
+    results = load_session_results(session_dir)
+    if results is None:
+        raise HTTPException(400, "No segmentation results.")
+
+    engine = SegmentQueryEngine(results["segments"])
+    return engine.execute({"action": req.action, "params": req.params})
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES: SESSION MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════
+
+@app.get("/sessions/{uid}")
+def get_sessions(uid: str):
+    _require_uid(uid)
+    return {"sessions": list_sessions(uid)}
+
+
+@app.get("/session/{uid}/{session_id}")
+def get_session(uid: str, session_id: str):
+    _require_uid(uid)
+
+    session_dir = get_session_dir(uid, session_id)
+    if not session_dir.exists():
+        raise HTTPException(404, "Session not found")
+
+    results = load_session_results(session_dir)
+    chat = load_chat(session_dir)
+
+    return {
+        "session_id": session_id,
+        "uid": uid,
+        "results": results,
+        "chat_history": chat,
+    }
+
+
+@app.get("/chat/{uid}/{session_id}")
+def get_chat_history(uid: str, session_id: str):
+    """
+    Return the saved chat messages for a session.
+
+    Returns:
+        [
+            {"role": "user", "content": "...", "timestamp": "..."},
+            {"role": "assistant", "content": "...", "timestamp": "...", "tool_calls": [...], "mode": "ai"},
+            ...
+        ]
+
+    Returns 404 if session or chat doesn't exist yet.
+    """
+    _require_uid(uid)
+
+    session_dir = get_session_dir(uid, session_id)
+    if not session_dir.exists():
+        raise HTTPException(404, "Session not found")
+
+    chat_path = session_dir / "chat.jsonl"
+    if not chat_path.exists():
+        raise HTTPException(404, "No chat history for this session")
+
+    chat = load_chat(session_dir)
+    return chat
+
+
+@app.get("/segments/{uid}/{session_id}")
+def get_segments(uid: str, session_id: str):
+    """
+    Return pre-computed segmentation results for a session.
+
+    Returns:
+        {
+            "segments": [ { "segment_id": 0, "type": "straight", ... }, ... ],
+            "summary": { "total_segments": 13, "counts_by_type": {...}, ... }
+        }
+
+    Returns 404 if session doesn't exist or hasn't been segmented yet.
+    """
+    _require_uid(uid)
+
+    session_dir = get_session_dir(uid, session_id)
+    if not session_dir.exists():
+        raise HTTPException(404, "Session not found")
+
+    results = load_session_results(session_dir)
+    if results is None:
+        raise HTTPException(404, "No segmentation results for this session")
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES: MESH (surface mesh for frontend 3D rendering)
+# ══════════════════════════════════════════════════════════════════════
+
+@app.get("/mesh/{uid}/{session_id}")
+def get_mesh(uid: str, session_id: str):
+    """
+    Return the triangulated surface mesh as JSON for VTK.js rendering.
+
+    Returns:
+        {
+            "vertices": [[x, y, z], ...],   # every point in the surface mesh
+            "faces": [[i, j, k], ...],       # triangle indices (0-based)
+        }
+    """
+    _require_uid(uid)
+
+    session_dir = get_session_dir(uid, session_id)
+    if not session_dir.exists():
+        raise HTTPException(404, "Session not found")
+
+    surface_path = session_dir / "mesh_surface.json"
+    if not surface_path.exists():
+        raise HTTPException(404, "No surface mesh available. Upload a .msh or .step file first.")
+
+    data = json.loads(surface_path.read_text())
+
+    # Sanitize: replace NaN/Inf with 0 (safety net)
+    verts = data.get("vertices", [])
+    clean_verts = []
+    for v in verts:
+        clean_verts.append([
+            0.0 if (x != x or abs(x) == float('inf')) else x
+            for x in v
+        ])
+    data["vertices"] = clean_verts
+
+    return data
+
+
+# ══════════════════════════════════════════════════════════════════════
+# WEBSOCKET: STREAMING PIPELINE + CHAT
+# ══════════════════════════════════════════════════════════════════════
+
+@app.websocket("/ws/{uid}/{session_id}")
+async def websocket_pipeline(ws: WebSocket, uid: str, session_id: str):
+    """
+    WebSocket for streaming pipeline updates + interactive chat.
+
+    Client sends:
+        {"type": "segment", "nodes": [...], "edges": [...], ...}
+        {"type": "upload_and_segment", "target_step": 1.0}
+        {"type": "query", "query": "show all arcs > 30 degrees"}
+        {"type": "dsl", "action": "filter", "params": {...}}
+        {"type": "highlight", "segment_ids": [1, 3]}
+
+    Server streams back:
+        {"type": "progress", "step": "...", "detail": {...}}
+        {"type": "result", "data": {...}}
+        {"type": "error", "message": "..."}
+    """
+    await ws.accept()
+
+    # Validate uid
+    if not validate_uid(uid):
+        await ws.send_json({"type": "error", "message": "Invalid uid. Login first."})
+        await ws.close(code=4001)
+        return
+
+    meta = create_session(uid, session_id)
+    session_dir = Path(meta["path"])
+
+    async def send(msg_type: str, **kwargs):
+        await ws.send_json({"type": msg_type, **kwargs})
+
+    def sync_progress(step: str, detail: dict):
+        _progress_queue.append({"type": "progress", "step": step, "detail": detail})
+
+    _progress_queue: list = []
+
+    try:
+        await send("connected", session=meta)
+
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await send("error", message="Invalid JSON")
+                continue
+
+            msg_type = msg.get("type", "")
+
+            # ── SEGMENT (inline) ──
+            if msg_type == "segment":
+                try:
+                    nodes = np.asarray(msg["nodes"], dtype=np.float64)
+                    edges = [(int(e[0]), int(e[1])) for e in msg["edges"]]
+                    target_step = msg.get("target_step", 1.0)
+                    target_nodes = msg.get("downsample_nodes", 16)
+                    do_embed = msg.get("embed", False)
+
+                    _progress_queue.clear()
+                    result = await asyncio.to_thread(
+                        run_full_pipeline,
+                        nodes, edges, session_dir,
+                        target_step=target_step,
+                        target_nodes=target_nodes,
+                        model=_MODEL if do_embed else None,
+                        device=_DEVICE,
+                        on_progress=sync_progress,
+                    )
+
+                    for p in _progress_queue:
+                        await ws.send_json(p)
+                    _progress_queue.clear()
+
+                    await send("result", data=result)
+
+                except Exception as e:
+                    await send("error", message=str(e), traceback=traceback.format_exc())
+
+            # ── SEGMENT from uploaded file ──
+            elif msg_type == "upload_and_segment":
+                try:
+                    cl_path = session_dir / "centerline.json"
+                    if not cl_path.exists():
+                        await send("error", message="No uploaded file. Use /upload first.")
+                        continue
+
+                    nodes, edges = read_centerline_json(str(cl_path))
+                    target_step = msg.get("target_step", 1.0)
+                    target_nodes = msg.get("downsample_nodes", 16)
+                    do_embed = msg.get("embed", False)
+
+                    _progress_queue.clear()
+                    result = await asyncio.to_thread(
+                        run_full_pipeline,
+                        nodes, edges, session_dir,
+                        target_step=target_step,
+                        target_nodes=target_nodes,
+                        model=_MODEL if do_embed else None,
+                        device=_DEVICE,
+                        on_progress=sync_progress,
+                    )
+
+                    for p in _progress_queue:
+                        await ws.send_json(p)
+                    _progress_queue.clear()
+
+                    await send("result", data=result)
+
+                except Exception as e:
+                    await send("error", message=str(e))
+
+            # ── QUERY (NL -> AI with function calling) ──
+            elif msg_type == "query":
+                try:
+                    query_text = msg.get("query", "")
+
+                    # 1. Load chat history BEFORE appending the new user message
+                    #    so the AI sees the full conversation context for follow-ups
+                    chat_history = load_chat(session_dir)
+
+                    # 2. Now append the user message to the persistent chat log
+                    append_chat(session_dir, "user", query_text)
+
+                    await send("progress", step="parsing_query",
+                               detail={"query": query_text},
+                               explanation=format_step_explanation("parsing_query", {"query": query_text}))
+
+                    results = load_session_results(session_dir)
+                    if results is None:
+                        await send("error", message="No segmentation results. Segment first.")
+                        continue
+
+                    _ai_progress: list = []
+
+                    def ai_on_step(step: str, detail: dict):
+                        _ai_progress.append({
+                            "type": "progress",
+                            "step": step,
+                            "detail": detail,
+                            "explanation": format_step_explanation(step, detail),
+                        })
+
+                    ai_result = await asyncio.to_thread(
+                        query_smart,
+                        query_text,
+                        results["segments"],
+                        chat_history,
+                        ai_on_step,
+                    )
+
+                    for p in _ai_progress:
+                        await ws.send_json(p)
+                    _ai_progress.clear()
+
+                    # 3. Save assistant response with tool_calls so future
+                    #    follow-ups can see what was previously computed
+                    append_chat(session_dir, "assistant", ai_result.get("answer", ""),
+                                extra={
+                                    "tool_calls": ai_result.get("tool_calls", []),
+                                    "mode": ai_result.get("mode"),
+                                })
+
+                    await send("result", data={
+                        "query": query_text,
+                        "answer": ai_result.get("answer", ""),
+                        "tool_calls": ai_result.get("tool_calls", []),
+                        "highlight_ids": ai_result.get("highlight_ids", []),
+                        "mode": ai_result.get("mode", "unknown"),
+                        "fallback_reason": ai_result.get("fallback_reason"),
+                    })
+
+                except Exception as e:
+                    await send("error", message=str(e))
+
+            # ── DSL (direct) ──
+            elif msg_type == "dsl":
+                try:
+                    results = load_session_results(session_dir)
+                    if results is None:
+                        await send("error", message="No segmentation results.")
+                        continue
+
+                    engine = SegmentQueryEngine(results["segments"])
+                    dsl_result = engine.execute({
+                        "action": msg.get("action", ""),
+                        "params": msg.get("params", {}),
+                    })
+                    await send("result", data=dsl_result)
+
+                except Exception as e:
+                    await send("error", message=str(e))
+
+            # ── HIGHLIGHT ──
+            elif msg_type == "highlight":
+                try:
+                    results = load_session_results(session_dir)
+                    if results is None:
+                        await send("error", message="No segmentation results.")
+                        continue
+
+                    engine = SegmentQueryEngine(results["segments"])
+                    highlight_data = engine.highlight_segments(msg.get("segment_ids", []))
+                    await send("result", data=highlight_data)
+
+                except Exception as e:
+                    await send("error", message=str(e))
+
+            else:
+                await send("error", message=f"Unknown message type: {msg_type}")
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await send("error", message=str(e))
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════

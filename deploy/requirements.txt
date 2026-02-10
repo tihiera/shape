@@ -2,6 +2,18 @@ numpy>=1.24.0
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
+websockets>=12.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# AI layer (Gemini)
+google-genai>=1.0.0
+
+# Geometry ingest (STEP files) + centerline extraction
+gmsh>=4.12.0
+meshio>=5.3.0
+vtk>=9.3.0
+scipy>=1.11.0
 
 # ML inference (optional — server works without these, just no embeddings)
 torch>=2.0.0

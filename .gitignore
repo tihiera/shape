@@ -3,3 +3,4 @@ dataset_output/dataset*
 dataset/
 processed/
 vir/
+.env
