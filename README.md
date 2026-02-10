@@ -10,6 +10,20 @@ Synthetic graph-based centerline representations of 3D geometric motifs (pipe-li
 Available at https://github.com/tihiera/shape-frontend
 Datasets is available at https://huggingface.co/datasets/bayang/shape
 
+### Sample Meshes
+
+Pre-built Gmsh `.msh` pipe network samples are available in [`deploy/samples/`](./deploy/samples/) for testing and demonstration:
+
+| File | Description | Size |
+|------|-------------|------|
+| `simple_bend.msh` | Single 90° pipe bend | 258 KB |
+| `u_bend.msh` | U-shaped 180° return bend | 343 KB |
+| `s_curve.msh` | S-shaped double bend | 359 KB |
+| `t_junction.msh` | T-junction (3-way split) | 401 KB |
+| `complex_network.msh` | Multi-branch pipe network with junctions, bends, and straights | 1.4 MB |
+
+These can be uploaded directly through the API or frontend to test the full segmentation pipeline.
+
 ## JSON Schema
  
 `dataset.json` is an array of shape records. Each record:

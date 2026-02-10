@@ -340,6 +340,22 @@ The system prompt (`ai/prompts.py`) provides Gemini with:
 
 ---
 
+## Sample Meshes
+
+Pre-built Gmsh 4.1 `.msh` pipe network samples are available in `samples/` for testing and demonstration:
+
+| File | Description | Geometry | Size |
+|------|-------------|----------|------|
+| `simple_bend.msh` | Single 90° pipe bend | 1 arc segment | 258 KB |
+| `u_bend.msh` | U-shaped 180° return bend | Straights + U-arc | 343 KB |
+| `s_curve.msh` | S-shaped double bend | 2 opposing arcs + straights | 359 KB |
+| `t_junction.msh` | T-junction (3-way split) | 1 junction + 3 branches | 401 KB |
+| `complex_network.msh` | Multi-branch pipe network | Multiple junctions, bends, straights, and corners | 1.4 MB |
+
+These files exercise the full pipeline (ingest → centerline extraction → segmentation → query). Upload via `POST /upload` or the frontend file picker.
+
+---
+
 ## Data Flow: Complete User Journey
 
 ```
@@ -436,6 +452,13 @@ deploy/
 │   ├── u_bend.msh
 │   ├── complex_network.msh
 │   └── t_junction.msh
+│
+├── samples/                    # Sample .msh files for demo & testing
+│   ├── simple_bend.msh         #   Single 90° bend (258 KB)
+│   ├── u_bend.msh              #   180° U-bend (343 KB)
+│   ├── s_curve.msh             #   S-shaped double bend (359 KB)
+│   ├── t_junction.msh          #   T-junction, 3-way (401 KB)
+│   └── complex_network.msh     #   Multi-branch network (1.4 MB)
 │
 └── data/                       # Runtime data (per-user, per-session)
     ├── users.json

@@ -218,6 +218,20 @@ GEMINI_MODEL=gemini-3-flash-preview   # default
 | "What's the sharpest corner and where is it?" | topk_by(corner_angle) → describe → highlight |
 | "Give me an overview of the pipe layout" | group_by + list_segments |
 
+## Sample Meshes
+
+Pre-built Gmsh `.msh` pipe network samples are available in [`samples/`](./samples/) for testing and demonstration:
+
+| File | Description | Size |
+|------|-------------|------|
+| `simple_bend.msh` | Single 90° pipe bend | 258 KB |
+| `u_bend.msh` | U-shaped 180° return bend | 343 KB |
+| `s_curve.msh` | S-shaped double bend | 359 KB |
+| `t_junction.msh` | T-junction (3-way split) | 401 KB |
+| `complex_network.msh` | Multi-branch pipe network with junctions, bends, and straights | 1.4 MB |
+
+Upload any of these via `POST /upload` or the frontend to test the full pipeline.
+
 ## Auth Flow (No Auth Service)
 
 ```
@@ -283,6 +297,12 @@ deploy/
 │   ├── encoder.pt              # Trained model
 │   └── meta.json               # Model metadata
 ├── mesh/                       # Test pipe meshes (5 types)
+├── samples/                    # Sample .msh files for demo & testing
+│   ├── simple_bend.msh         #   Single 90° bend
+│   ├── u_bend.msh              #   180° U-bend
+│   ├── s_curve.msh             #   S-shaped double bend
+│   ├── t_junction.msh          #   T-junction (3-way)
+│   └── complex_network.msh     #   Multi-branch network
 ├── requirements.txt
 ├── Dockerfile
 ├── ARCHITECTURE.md             # Full architecture docs + Gemini deep-dive
